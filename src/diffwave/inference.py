@@ -26,7 +26,8 @@ from diffwave.model import DiffWave
 
 models = {}
 # changed function signature
-def predict(spectrogram=None, model_dir=None, params=None, device=torch.device('cuda'), fast_sampling=False, expose_latent_vars=False, inject_latent_var=None): 
+def predict(spectrogram=None, model_dir=None, params=None, device=torch.device('cuda'), 
+            fast_sampling=False, expose_latent_vars=False, inject_latent_var=None, compute_jacobian=False): 
   """
   This function is mostly the same, except for expose_latent_vars and inject_latent_var
   
@@ -48,7 +49,9 @@ def predict(spectrogram=None, model_dir=None, params=None, device=torch.device('
 
   model = models[model_dir]
   model.params.override(params)
-  with torch.no_grad():
+  
+  context = torch.enable_grad() if compute_jacobian else torch.no_grad()
+  with context:
     # Change in notation from the DiffWave paper for fast sampling.
     # DiffWave paper -> Implementation below
     # --------------------------------------
@@ -85,15 +88,22 @@ def predict(spectrogram=None, model_dir=None, params=None, device=torch.device('
       audio = torch.randn(1, params.audio_len, device=device)
     noise_scale = torch.from_numpy(alpha_cum**0.5).float().unsqueeze(1).to(device)
 
-    # MODIFIED CODE
-    # deal with injection logic
+    # ---------------------------------------------------------
+    # MODIFIED: injecting a latent variable at timestep i
+    # ---------------------------------------------------------
     if inject_latent_var is not None:
-      start_time, audio = inject_latent_var
+      latent_step, audio = inject_latent_var  # replace audio init with provided latent
+      audio = audio.clone().detach().to(device)
+
+      # MODIFIED: enable gradient tracking if Jacobian is required
+      # if compute_jacobian:
+      #   audio.requires_grad_(True)
+
+      start_time = latent_step  # start denoising from the injected timestep
     else:
       start_time = len(alpha) - 1
+    # ---------------------------------------------------------
     latent_vars = {}
-    # MODIFIED CODE
-
     for n in range(start_time, -1, -1):
       c1 = 1 / alpha[n]**0.5
       c2 = beta[n] / (1 - alpha_cum[n])**0.5
@@ -103,11 +113,26 @@ def predict(spectrogram=None, model_dir=None, params=None, device=torch.device('
         sigma = ((1.0 - alpha_cum[n-1]) / (1.0 - alpha_cum[n]) * beta[n])**0.5
         audio += sigma * noise
       audio = torch.clamp(audio, -1.0, 1.0)
+      # ---------------------------------------------------------
       # MODIFIED CODE
+      # ---------------------------------------------------------
       # if latent vars need to be returned, return in latent_vars dict
       if expose_latent_vars:
         latent_vars[n] = audio
-      # MODIFIED CODE
+      # ---------------------------------------------------------
+    # ---------------------------------------------------------
+    # MODIFIED: TODO need to implement Jacobian logic, computationally infeasible to just call autograd
+    # ---------------------------------------------------------
+    if compute_jacobian:
+      pass
+      # # function that re-runs prediction with x as injected latent
+      # def f(x):
+      #   return predict(spectrogram, model_dir, params, device, fast_sampling,
+      #                 False, (latent_step, x), False)[0]
+
+      # J = torch.autograd.functional.jacobian(f, audio)
+      # return audio, model.params.sample_rate, latent_vars, J
+    # ---------------------------------------------------------
   return audio, model.params.sample_rate, latent_vars
 
 
