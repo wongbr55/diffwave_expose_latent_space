@@ -25,8 +25,16 @@ from diffwave.model import DiffWave
 
 
 models = {}
-
-def predict(spectrogram=None, model_dir=None, params=None, device=torch.device('cuda'), fast_sampling=False):
+# changed function signature
+def predict(spectrogram=None, model_dir=None, params=None, device=torch.device('cuda'), fast_sampling=False, expose_latent_vars=False, inject_latent_var=None): 
+  """
+  This function is mostly the same, except for expose_latent_vars and inject_latent_var
+  
+  If expose_latent_vars is True, then we return the latent variables for the batch, otherwise returns an empty dict
+  If inject_latent_var is not None, then it must be of the form (i, latent_var) where i is the timestep of latent_var
+  """
+  
+  
   # Lazy load model.
   if not model_dir in models:
     if os.path.exists(f'{model_dir}/weights.pt'):
@@ -77,7 +85,16 @@ def predict(spectrogram=None, model_dir=None, params=None, device=torch.device('
       audio = torch.randn(1, params.audio_len, device=device)
     noise_scale = torch.from_numpy(alpha_cum**0.5).float().unsqueeze(1).to(device)
 
-    for n in range(len(alpha) - 1, -1, -1):
+    # MODIFIED CODE
+    # deal with injection logic
+    if inject_latent_var is not None:
+      start_time, audio = inject_latent_var
+    else:
+      start_time = len(alpha) - 1
+    latent_vars = {}
+    # MODIFIED CODE
+
+    for n in range(start_time, -1, -1):
       c1 = 1 / alpha[n]**0.5
       c2 = beta[n] / (1 - alpha_cum[n])**0.5
       audio = c1 * (audio - c2 * model(audio, torch.tensor([T[n]], device=audio.device), spectrogram).squeeze(1))
@@ -86,7 +103,12 @@ def predict(spectrogram=None, model_dir=None, params=None, device=torch.device('
         sigma = ((1.0 - alpha_cum[n-1]) / (1.0 - alpha_cum[n]) * beta[n])**0.5
         audio += sigma * noise
       audio = torch.clamp(audio, -1.0, 1.0)
-  return audio, model.params.sample_rate
+      # MODIFIED CODE
+      # if latent vars need to be returned, return in latent_vars dict
+      if expose_latent_vars:
+        latent_vars[n] = audio
+      # MODIFIED CODE
+  return audio, model.params.sample_rate, latent_vars
 
 
 def main(args):
