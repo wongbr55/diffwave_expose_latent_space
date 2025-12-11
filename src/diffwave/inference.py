@@ -27,9 +27,9 @@ from diffwave.model import DiffWave
 models = {}
 # changed function signature
 def predict(spectrogram=None, model_dir=None, params=None, device=torch.device('cuda'), 
-            fast_sampling=False, expose_latent_vars=False, inject_latent_var=None, compute_jacobian=False): 
+            fast_sampling=True, expose_latent_vars=False, inject_latent_var=None, compute_jacobian=False): 
   """
-  This function is mostly the same, except for expose_latent_vars and inject_latent_var
+  This function is mostly the same, except for expose_latent_vars and inject_latent_var and compute_jacobian
   
   If expose_latent_vars is True, then we return the latent variables for the batch, otherwise returns an empty dict
   If inject_latent_var is not None, then it must be of the form (i, latent_var) where i is the timestep of latent_var
