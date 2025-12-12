@@ -56,7 +56,7 @@ def generate_latent_and_mel(file_dir: str, save_dir: str, model_dir: str, fast_s
     for filename in os.listdir(file_dir):
         if filename.endswith(".hdf5"):
             file_path = os.path.join(file_dir, filename)
-            curr_dir = f"{save_dir}/{file_path.removesuffix(".hdf5")}"
+            curr_dir = f"{save_dir}/{file_path.removesuffix('.hdf5')}"
             os.makedirs(curr_dir, exist_ok=True)
             # load data from file
             data = load_h5py_file(file_path)
@@ -124,3 +124,9 @@ def load_h5py_file(file_path: str):
             data['block_num'].append(block_num)
             data['trial_num'].append(trial_num)
     return data
+
+
+if __name__ == "__main__":
+    generate_latent_and_mel("/scratch/wongbr55/brain_to_text_25/t15_copyTask_neuralData/hdf5_data_final",
+                            "/scratch/wongbr55/latent_mel_data",
+                            "/home/wongbr55/diff_brain_decoding/diffwave_expose_latent_space/pretrained_model/diffwave-ljspeech-22kHz-1000578.pt")
