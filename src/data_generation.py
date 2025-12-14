@@ -16,7 +16,7 @@ import h5py
 # DiffWave only works with a specific sample rate
 SAMPLE_RATE = 22050
 
-def generate_audio_waveforms(sentences: list[str], output_dir: str, tts_dir: str):
+def generate_audio_waveforms(sentences: list[str], output_dir: str, voice: PiperVoice):
     """Generates the audio waveforms for ground truth sentences and saves them in output_dir
 
     Args:
@@ -26,8 +26,6 @@ def generate_audio_waveforms(sentences: list[str], output_dir: str, tts_dir: str
     
     os.makedirs(output_dir, exist_ok=True)
     for i, text in enumerate(sentences, start=1):
-        
-        voice = PiperVoice.load(tts_dir)
         with wave.open(f"{output_dir}/sentence_{i}.wav", "wb") as wav_file:
             voice.synthesize(text, wav_file)
             
@@ -59,6 +57,8 @@ def generate_latent_and_mel(file_dir: str, save_dir: str, model_dir: str, tts_di
     :param fast_sampling: boolean for controlling fast sampling for diffusion, if True diffusion has 6 denoising steps
     :type fast_sampling: bool
     """
+    # load voice to generate tts
+    voice = PiperVoice.load(tts_dir)
     # collect data from file_dir
     os.makedirs(save_dir, exist_ok=True)
     for dir in os.listdir(file_dir):
@@ -70,7 +70,7 @@ def generate_latent_and_mel(file_dir: str, save_dir: str, model_dir: str, tts_di
                 # load data from file
                 data = load_h5py_file(file_path)
                 # generate audio waveforms
-                generate_audio_waveforms(data["sentence_label"], curr_dir, tts_dir)
+                generate_audio_waveforms(data["sentence_label"], curr_dir, voice)
                 # generate mel spectrograms
                 mel_spectrogram_proccess(curr_dir)
                 # generate latent variables for each sentence
@@ -88,10 +88,9 @@ def generate_latent_and_mel(file_dir: str, save_dir: str, model_dir: str, tts_di
                         "latent_variables": latent_vars_serializable,
                         "neural_features": neural_features.tolist() if isinstance(neural_features, np.ndarray) else neural_features
                     }
-                    with open(os.path.join(curr_dir, f"sentence_{i}_neural_latent_data.json"), "w") as f:
+                    with open(os.path.join(curr_dir, f"sentence_{i+1}_neural_latent_data.json"), "w") as f:
                         json.dump(curr_sentence_data, f, indent=4)
         
-        break
 # CODE TAKEN FROM KAGGLE TO LOAD DATA
 def load_h5py_file(file_path: str):
     data = {
