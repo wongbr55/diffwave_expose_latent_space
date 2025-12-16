@@ -61,11 +61,16 @@ def generate_latent_and_mel(file_dir: str, save_dir: str, model_dir: str, tts_di
     voice = PiperVoice.load(tts_dir)
     # collect data from file_dir
     os.makedirs(save_dir, exist_ok=True)
-    for dir in os.listdir(file_dir):
-        for filename in os.listdir(f"{file_dir}/{dir}"):
-            if filename.endswith(".hdf5"):
-                file_path = os.path.join(f"{file_dir}/{dir}", filename)
-                curr_dir = f"{save_dir}/{dir}/{filename.removesuffix('.hdf5')}"
+    for dir_name in os.listdir(file_dir):
+        dst_path = os.path.join(save_dir, dir_name)
+        # skip if target directory already exists
+        if os.path.exists(dst_path):
+            print(f"Skipping {dir_name}, already exists in save_dir.")
+            continue
+        for filename in os.listdir(f"{file_dir}/{dir_name}"):
+            if filename.endswith(".hdf5") and "data_test" not in filename:
+                file_path = os.path.join(f"{file_dir}/{dir_name}", filename)
+                curr_dir = f"{save_dir}/{dir_name}/{filename.removesuffix('.hdf5')}"
                 os.makedirs(curr_dir, exist_ok=True)
                 # load data from file
                 data = load_h5py_file(file_path)
