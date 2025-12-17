@@ -11,9 +11,8 @@ def collate_fn(batch):
     lengths = torch.tensor([b["target_len"] for b in batch])
 
     max_len = lengths.max()
-    D_out = targets[0].shape[1]
 
-    padded_targets = torch.zeros(len(batch), max_len, D_out)
+    padded_targets = torch.zeros(len(batch), max_len)
     stop_targets = torch.zeros(len(batch), max_len)
 
     for i, (tgt, L) in enumerate(zip(targets, lengths)):
@@ -52,8 +51,6 @@ def construct_dataset(data_dir: str, latent_timestep: int):
     val_dataset = NeuralLatentDataset(data_dict["X_val"], data_dict["Y_val"])
     
     return train_dataset, val_dataset
-
-
 
 
 def load_data(data_dir: str, latent_timestep: int, load_train: bool, load_val: bool):
