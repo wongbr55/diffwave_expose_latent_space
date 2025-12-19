@@ -37,7 +37,7 @@ class NeuralLatentDataset(Dataset):
         return {"inputs": src, "targets": target, "target_len": target.shape[0]}
 
 
-def construct_dataset(data_dir: str, latent_timestep: int):
+def construct_latent_dataset(data_dir: str, latent_timestep: int):
     
     """Constructs torch Datasets for training and validation splits
 
@@ -46,14 +46,14 @@ def construct_dataset(data_dir: str, latent_timestep: int):
         latent_stimestep (int): latent timestep to use (within [0, 5] with 5 being the most noisy and 0 being the denoised waveform)
     """
     
-    data_dict = load_data(data_dir, latent_timestep, True, True)
+    data_dict = load_latent_neural_data(data_dir, latent_timestep, True, True)
     train_dataset = NeuralLatentDataset(data_dict["X_train"], data_dict["Y_train"])
     val_dataset = NeuralLatentDataset(data_dict["X_val"], data_dict["Y_val"])
     
     return train_dataset, val_dataset
 
 
-def load_data(data_dir: str, latent_timestep: int, load_train: bool, load_val: bool):
+def load_latent_neural_data(data_dir: str, latent_timestep: int, load_train: bool, load_val: bool):
     """Loads data from save directory into X, Y
     
     ~3.5 minutues to load all of the training data
