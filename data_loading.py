@@ -4,23 +4,6 @@ import numpy as np
 import json
 from torch.utils.data import Dataset
 
-def collate_fn(batch):
-    inputs = torch.stack([b["inputs"] for b in batch])
-
-    targets = [b["targets"] for b in batch]
-    lengths = torch.tensor([b["target_len"] for b in batch])
-
-    max_len = lengths.max()
-
-    padded_targets = torch.zeros(len(batch), max_len)
-    stop_targets = torch.zeros(len(batch), max_len)
-
-    for i, (tgt, L) in enumerate(zip(targets, lengths)):
-        padded_targets[i, :L] = tgt
-        stop_targets[i, L - 1] = 1.0
-
-    return inputs, padded_targets, stop_targets, lengths
-
 class NeuralLatentDataset(Dataset):
     def __init__(self, neural: list, latent: list):
         self.neural = neural
