@@ -317,9 +317,10 @@ def train_loop(train_loader, model, device, optimizer, stop_loss_threshold):
 
         stop_loss = F.binary_cross_entropy_with_logits(
             stop_logits[last_mask],
-            stop_targets[last_mask],
+            stop_targets[:, 1:T_pred+1][last_mask],
             reduction="sum"
         )
+
 
         loss = reg_loss + stop_loss_threshold * stop_loss
         loss.backward()
@@ -363,7 +364,7 @@ def val_loop(val_loader, model, device, stop_loss_threshold):
 
             stop_loss = F.binary_cross_entropy_with_logits(
                 stop_logits[last_mask],
-                stop_targets[last_mask],
+                stop_targets[:, 1:T_pred+1][last_mask],
                 reduction="sum"
             )
 
