@@ -1,7 +1,8 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.cuda.amp import autocast, GradScaler
+import torch.distributed as dist
+from torch.utils.data import DistributedSampler
 import numpy as np
 from data_loading import construct_latent_dataset
 from torch.nn.utils.rnn import pad_sequence
@@ -10,7 +11,16 @@ from torch.optim import AdamW
 import matplotlib.pyplot as plt
 import pdb
 import json
+import os
 
+
+def setup_ddp(rank, world_size):
+    dist.init_process_group(
+        backend="nccl",
+        rank=rank,
+        world_size=world_size
+    )
+    torch.cuda.set_device(rank)
 
 
 ###################################
@@ -57,11 +67,11 @@ class Encoder(nn.Module):
         return memory, padding_mask
 
 class RNNEncoder(nn.Module):
-    def __init__(self, input_dim, d_model):
+    def __init__(self, input_dim, d_model, num_layers=1):
         super().__init__()
         self.in_proj = nn.Linear(input_dim, d_model)
         # self.pos_enc = SinusoidalPositionalEncoding(d_model)
-        self.rnn = nn.LSTM(d_model, d_model, num_layers=1, batch_first=True, bidirectional=False)
+        self.rnn = nn.LSTM(d_model, d_model, num_layers=num_layers, batch_first=True, bidirectional=False)
     
     def forward(self, x, input_lengths):
         B, T, __ = x.shape
@@ -102,7 +112,7 @@ class RNNDecoder(nn.Module):
         x, _ = nn.utils.rnn.pad_packed_sequence(packed_out, batch_first=True)
 
         preds = self.out(x).squeeze(-1)
-        stop_logits = torch.sigmoid(self.stop(x).squeeze(-1))
+        stop_logits = self.stop(x).squeeze(-1)
         return preds, stop_logits
 
 
@@ -110,6 +120,11 @@ class RNNDecoder(nn.Module):
 # FULL MODEL
 ###################################
 class NeuralToLatentModel(nn.Module):
+    
+    """NOTE that at inference time for stop output of decoder, need to run through sigmoid
+    """
+    
+    
     def __init__(self, input_dim, d_model):
         super().__init__()
         self.encoder = RNNEncoder(input_dim, d_model)
@@ -256,8 +271,9 @@ def collate_fn(batch):
 # TRAINING LOOPS
 ###################################
 
-def train_loop(train_loader, model, device, optimizer, stop_loss_threshold):
+def train_loop(train_loader, model, device, optimizer, stop_loss_threshold, sampler, epoch):
     model.train()
+    sampler.set_epoch(epoch)
     train_loss_sum = 0.0
     train_reg_sum = 0.0
     train_stop_sum = 0.0
@@ -266,7 +282,8 @@ def train_loop(train_loader, model, device, optimizer, stop_loss_threshold):
     for inputs, input_lengths, targets, target_lengths, stop_targets, lengths in train_loader:
         # if loop_counter > 0:
         #     break
-        print(f"Training loop iteration {loop_counter}")
+        if rank == 0:
+            print(f"Training loop iteration {loop_counter}")
         loop_counter += 1
         inputs = inputs.to(device)
         input_lengths = input_lengths.to(device)
@@ -312,8 +329,9 @@ def train_loop(train_loader, model, device, optimizer, stop_loss_threshold):
         train_count += num_valid
     return train_loss_sum, train_reg_sum, train_stop_sum, train_count
 
-def val_loop(val_loader, model, device, stop_loss_threshold):
+def val_loop(val_loader, model, device, stop_loss_threshold, sampler, epoch):
     model.eval()
+    sampler.set_epoch(epoch)
     val_loss_sum = 0.0
     val_reg_sum = 0.0
     val_stop_sum = 0.0
@@ -324,7 +342,8 @@ def val_loop(val_loader, model, device, stop_loss_threshold):
         for inputs, input_lengths, targets, target_lengths, stop_targets, lengths in val_loader:
             # if loop_iteration > 0:
             #     break
-            print(f"Val loop iteration {loop_iteration}")
+            if rank == 0:
+                print(f"Val loop iteration {loop_iteration}")
             loop_iteration += 1
             inputs = inputs.to(device)
             targets = targets.to(device)
@@ -368,38 +387,79 @@ def val_loop(val_loader, model, device, stop_loss_threshold):
 # requires at least 1 node with 4 GPUs to run
 if __name__ == "__main__":
     # PARAMETERS    
+    rank = int(os.environ["LOCAL_RANK"])
+    world_size = int(os.environ["WORLD_SIZE"])
+    setup_ddp(rank, world_size)
+    
     MODEL_NAME = "toy_model"
     INPUT_DIM = 512
     d_model = 128
     num_epochs = 10
-    model = NeuralToLatentModel(INPUT_DIM, d_model)
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    print(f"Device: {device}")
-    # does not work for arb. len sequences
-    # model = nn.DataParallel(model)
-    model = model.to(device)
-    # model = torch.compile(model, backend="aot_eager", fullgraph=False)
-    optimizer = AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=5e-4)
     stop_loss_threshold = 0.5
     batch_size = 128
     
+    
+    
+    
+    # does not work for arb. len sequences
+    # model = model.to(device)
+    # model = torch.compile(model, backend="aot_eager", fullgraph=False)
+    
+    
+    local_batch_size = batch_size // world_size
+    device = torch.device(f"cuda:{rank}")
+    model = NeuralToLatentModel(INPUT_DIM, d_model)
+    model = model.to(rank)
+    model = torch.nn.parallel.DistributedDataParallel(
+        model,
+        device_ids=[rank],
+        output_device=rank
+    )
+    optimizer = AdamW(model.parameters(), lr=5e-4)
+    
+    
     train_dataset, val_dataset = construct_latent_dataset("/scratch/wongbr55/latent_mel_data", 3)
-    print(f"Number of training examples: {len(train_dataset)}")
-    print(f"Number of val examples: {len(val_dataset)}")
-    print(f"Number of train loop iterations: {len(train_dataset) // batch_size}")
-    print(f"Number of val loop iterations: {len(val_dataset) // batch_size}")
+    if rank == 0:
+        print(f"Device: {'cuda' if torch.cuda.is_available() else 'cpu'}")
+        print(f"Number of training examples: {len(train_dataset)}")
+        print(f"Number of val examples: {len(val_dataset)}")
+        print(f"Number of train loop iterations: {len(train_dataset) // batch_size}")
+        print(f"Number of val loop iterations: {len(val_dataset) // batch_size}")
+    
+    
+    train_sampler = DistributedSampler(
+        train_dataset,
+        num_replicas=world_size,
+        rank=rank,
+        shuffle=True
+    )
+    val_sampler = DistributedSampler(
+        val_dataset,
+        num_replicas=world_size,
+        rank=rank,
+        shuffle=False
+    )
+    
     train_loader = DataLoader(
         train_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        collate_fn=collate_fn
+        batch_size=local_batch_size,
+        shuffle=False,
+        collate_fn=collate_fn,
+        pin_memory=True,
+        persistent_workers=True,
+        num_workers = 8,
+        sampler=train_sampler
     )
 
     val_loader = DataLoader(
         val_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        collate_fn=collate_fn
+        batch_size=local_batch_size,
+        shuffle=False,
+        collate_fn=collate_fn,
+        pin_memory=True,
+        persistent_workers=True,
+        num_workers = 8,
+        sampler=val_sampler
     )
     
     train_total_loss = []
@@ -411,10 +471,11 @@ if __name__ == "__main__":
     val_stop_loss = []
     
     for epoch in range(num_epochs):
-        print(f"##############")
-        print(f"Starting epoch {epoch}")
-        train_loss_sum, train_reg_sum, train_stop_sum, train_count = train_loop(train_loader, model, device, optimizer, stop_loss_threshold)
-        val_loss_sum, val_reg_sum, val_stop_sum, val_count = val_loop(val_loader, model, device, stop_loss_threshold)
+        if rank == 0:
+            print(f"##############")
+            print(f"Starting epoch {epoch}")
+        train_loss_sum, train_reg_sum, train_stop_sum, train_count = train_loop(train_loader, model, device, optimizer, stop_loss_threshold, train_sampler, epoch)
+        val_loss_sum, val_reg_sum, val_stop_sum, val_count = val_loop(val_loader, model, device, stop_loss_threshold, val_sampler, epoch)
         
         avg_train_loss = train_loss_sum / train_count
         avg_train_reg = train_reg_sum / train_count
@@ -432,17 +493,18 @@ if __name__ == "__main__":
         val_reg_loss.append(avg_val_reg)
         val_stop_loss.append(avg_val_stop)
         
-        torch.save({
-        "epoch": epoch,
-        "model_state_dict": model.state_dict(),
-        "optimizer_state_dict": optimizer.state_dict(),
-        "train_total_loss" : train_total_loss,
-        "train_reg_loss" : train_reg_loss,
-        "train_stop_loss" : train_stop_loss,
-        "val_total_loss" : val_total_loss,
-        "val_reg_loss" : val_reg_loss,
-        "val_stop_loss" : val_stop_loss
-        }, f"/scratch/wongbr55/{MODEL_NAME}_checkpoint_epoch_{epoch}.pt")
+        if rank == 0:
+            torch.save({
+            "epoch": epoch,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "train_total_loss" : train_total_loss,
+            "train_reg_loss" : train_reg_loss,
+            "train_stop_loss" : train_stop_loss,
+            "val_total_loss" : val_total_loss,
+            "val_reg_loss" : val_reg_loss,
+            "val_stop_loss" : val_stop_loss
+            }, f"/scratch/wongbr55/{MODEL_NAME}_checkpoint_epoch_{epoch}.pt")
         
 
     # torch.save({
@@ -450,38 +512,38 @@ if __name__ == "__main__":
     # "model_state_dict": model.state_dict(),
     # "optimizer_state_dict": optimizer.state_dict(),
     # }, f"/scratch/wongbr55/{MODEL_NAME}_checkpoint.pt")
+    if rank == 0:
+        epochs = range(1, len(train_total_loss) + 1)
+        fig, axes = plt.subplots(1, 3, figsize=(18, 4))
 
-    epochs = range(1, len(train_total_loss) + 1)
-    fig, axes = plt.subplots(1, 3, figsize=(18, 4))
+        # Regression loss
+        axes[0].plot(epochs, train_reg_loss, label="Train Reg")
+        axes[0].plot(epochs, val_reg_loss, label="Val Reg")
+        axes[0].set_title("Regression Loss")
+        axes[0].set_xlabel("Epoch")
+        axes[0].set_ylabel("Loss")
+        axes[0].legend()
+        axes[0].grid(True)
 
-    # Regression loss
-    axes[0].plot(epochs, train_reg_loss, label="Train Reg")
-    axes[0].plot(epochs, val_reg_loss, label="Val Reg")
-    axes[0].set_title("Regression Loss")
-    axes[0].set_xlabel("Epoch")
-    axes[0].set_ylabel("Loss")
-    axes[0].legend()
-    axes[0].grid(True)
+        # Stop loss
+        axes[1].plot(epochs, train_stop_loss, label="Train Stop")
+        axes[1].plot(epochs, val_stop_loss, label="Val Stop")
+        axes[1].set_title("Stop Loss")
+        axes[1].set_xlabel("Epoch")
+        axes[1].set_ylabel("Loss")
+        axes[1].legend()
+        axes[1].grid(True)
+        
+        axes[2].plot(epochs, train_total_loss, label="Train Total Loss")
+        axes[2].plot(epochs, val_total_loss, label="Val Total Loss")
+        axes[2].set_title("Total Loss")
+        axes[2].set_xlabel("Epoch")
+        axes[2].set_ylabel("Loss")
+        axes[2].legend()
+        axes[2].grid(True)
 
-    # Stop loss
-    axes[1].plot(epochs, train_stop_loss, label="Train Stop")
-    axes[1].plot(epochs, val_stop_loss, label="Val Stop")
-    axes[1].set_title("Stop Loss")
-    axes[1].set_xlabel("Epoch")
-    axes[1].set_ylabel("Loss")
-    axes[1].legend()
-    axes[1].grid(True)
-    
-    axes[2].plot(epochs, train_total_loss, label="Train Total Loss")
-    axes[2].plot(epochs, val_total_loss, label="Val Total Loss")
-    axes[2].set_title("Total Loss")
-    axes[2].set_xlabel("Epoch")
-    axes[2].set_ylabel("Loss")
-    axes[2].legend()
-    axes[2].grid(True)
-
-    plt.tight_layout()
-    plt.savefig(f"/scratch/wongbr55/{MODEL_NAME}_loss_components.png", dpi=300)
-    plt.show()
+        plt.tight_layout()
+        plt.savefig(f"/scratch/wongbr55/{MODEL_NAME}_loss_components.png", dpi=300)
+        plt.show()
 
     
