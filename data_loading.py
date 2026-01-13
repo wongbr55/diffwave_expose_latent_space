@@ -5,19 +5,48 @@ import json
 from torch.utils.data import Dataset
 
 class NeuralLatentDataset(Dataset):
-    def __init__(self, neural: list, latent: list):
-        self.neural = neural
-        self.latent = latent
+    
+    """If train_or_val is True, it is Train set, otherwise val set
+    """
+    def __init__(self, train_or_val: bool, data_dir: str, latent_timestep: int):
+    
+        super().__init__()
+        self.files = []
+        self.data_dir = data_dir
+        self.latent_timestep = latent_timestep
+        
+        assert latent_timestep <= 5
+        assert latent_timestep >= 0
+        
+        data_type = "data_train" if train_or_val else "data_val"
+        for data_date in os.listdir(data_dir):
+            date_path = os.path.join(data_dir, data_date)
+            if not os.path.isdir(date_path):
+                continue
+
+            inter_path = os.path.join(data_date, data_type)
+            full_inter_path = os.path.join(data_dir, inter_path)
+
+            if not os.path.isdir(full_inter_path):
+                continue
+
+            for file in os.listdir(full_inter_path):
+                if "neural_latent_data" in file:
+                    self.files.append(os.path.join(inter_path, file))
 
     def __len__(self):
-        return len(self.neural)
+        return len(self.files)
 
     def __getitem__(self, idx):
 
-        src = self.neural[idx]
-        target = self.latent[idx]
+        npz_path = os.path.join(self.data_dir, self.files[idx])
+        with np.load(npz_path) as data:
+            X = data["neural"].astype(np.float32)
+            Y = data["latent"][self.latent_timestep].astype(np.float32)
+        X = torch.from_numpy(X)
+        Y = torch.from_numpy(Y)
 
-        return {"inputs": src, "targets": target, "target_len": target.shape[0]}
+        return {"inputs": X, "targets": Y, "target_len": Y.shape[0]}
 
 
 def construct_latent_dataset(data_dir: str, latent_timestep: int):
@@ -29,9 +58,9 @@ def construct_latent_dataset(data_dir: str, latent_timestep: int):
         latent_stimestep (int): latent timestep to use (within [0, 5] with 5 being the most noisy and 0 being the denoised waveform)
     """
     
-    data_dict = load_latent_neural_data(data_dir, latent_timestep, True, True)
-    train_dataset = NeuralLatentDataset(data_dict["X_train"], data_dict["Y_train"])
-    val_dataset = NeuralLatentDataset(data_dict["X_val"], data_dict["Y_val"])
+    # data_dict = load_latent_neural_data(data_dir, latent_timestep, True, True)
+    train_dataset = NeuralLatentDataset(True, data_dir, latent_timestep)
+    val_dataset = NeuralLatentDataset(False, data_dir, latent_timestep)
     
     return train_dataset, val_dataset
 
