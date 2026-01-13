@@ -43,8 +43,8 @@ class NeuralLatentDataset(Dataset):
         with np.load(npz_path) as data:
             X = data["neural"].astype(np.float32)
             Y = data["latent"][self.latent_timestep].astype(np.float32)
-        X = torch.from_numpy(X)
-        Y = torch.from_numpy(Y)
+        # X = torch.from_numpy(X)
+        # Y = torch.from_numpy(Y)
 
         return {"inputs": X, "targets": Y, "target_len": Y.shape[0]}
 
