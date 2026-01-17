@@ -49,6 +49,46 @@ class NeuralLatentDataset(Dataset):
         return {"inputs": X, "targets": Y, "target_len": Y.shape[0]}
 
 
+class NeuralLatentWERDataset(Dataset):
+    def __init__(self, data_dir: str):
+        super().__init__()
+        self.files = []
+        self.data_dir = data_dir
+
+
+        data_type = "data_val"
+        for data_date in os.listdir(data_dir):
+            date_path = os.path.join(data_dir, data_date)
+            if not os.path.isdir(date_path):
+                continue
+
+            inter_path = os.path.join(data_date, data_type)
+            full_inter_path = os.path.join(data_dir, inter_path)
+
+            if not os.path.isdir(full_inter_path):
+                continue
+            
+            # there should 3 * W files in full_inter_path, where W = # of waveforms/sentences
+            for i in range(1, len(os.listdir(data_dir)) // 3 + 1):
+                wav_path = os.path.join(full_inter_path, f"sentence_{i}_neural_latent_data.npz")
+                mel_spec_path = os.path.join(full_inter_path, f"sentence_{i}.wav.spec.npy")
+                self.files.append((wav_path, mel_spec_path))
+    
+    def __len__(self):
+        return len(self.files)
+    
+    def __getitem__(self, index):
+        wav_path, mel_spec_path = self.files[index]
+        npz_path = os.path.join(self.data_dir, wav_path)
+        with np.load(npz_path) as data:
+            neural_data = data["neural"].astype(np.float32)
+            wav = data["latent"][0].astype(np.float32)
+        mel_spec = np.load(mel_spec_path)
+        
+        return {"inputs" : neural_data, "wav_form" : wav, "mel_spec" : mel_spec}
+            
+        
+
 def construct_latent_dataset(data_dir: str, latent_timestep: int):
     
     """Constructs torch Datasets for training and validation splits
