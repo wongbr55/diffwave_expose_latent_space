@@ -4,6 +4,11 @@ import numpy as np
 import json
 from torch.utils.data import Dataset
 
+from encodec import EncodecModel
+from encodec.utils import convert_audio
+import pdb
+SAMPLE_RATE = 22050
+
 class NeuralLatentDataset(Dataset):
     
     """If train_or_val is True, it is Train set, otherwise val set
@@ -50,11 +55,11 @@ class NeuralLatentDataset(Dataset):
 
 
 class NeuralLatentWERDataset(Dataset):
-    def __init__(self, data_dir: str):
+    def __init__(self, data_dir: str, latent_timestep: int):
         super().__init__()
         self.files = []
         self.data_dir = data_dir
-
+        self.latent_timestep = latent_timestep
 
         data_type = "data_val"
         for data_date in os.listdir(data_dir):
@@ -69,9 +74,12 @@ class NeuralLatentWERDataset(Dataset):
                 continue
             
             # there should 3 * W files in full_inter_path, where W = # of waveforms/sentences
-            for i in range(1, len(os.listdir(data_dir)) // 3 + 1):
+            # to be "safe" we use the if condition to get out of the loop
+            for i in range(1, len(os.listdir(data_dir))):
                 wav_path = os.path.join(full_inter_path, f"sentence_{i}_neural_latent_data.npz")
                 mel_spec_path = os.path.join(full_inter_path, f"sentence_{i}.wav.spec.npy")
+                if not os.path.exists(wav_path) or not os.path.exists(mel_spec_path):
+                    break
                 self.files.append((wav_path, mel_spec_path))
     
     def __len__(self):
@@ -82,10 +90,13 @@ class NeuralLatentWERDataset(Dataset):
         npz_path = os.path.join(self.data_dir, wav_path)
         with np.load(npz_path) as data:
             neural_data = data["neural"].astype(np.float32)
+            if self.latent_timestep > 0:
+                targets = data["latent"][self.latent_timestep]
             wav = data["latent"][0].astype(np.float32)
         mel_spec = np.load(mel_spec_path)
+        mel = torch.from_numpy(mel_spec).float()
         
-        return {"inputs" : neural_data, "wav_form" : wav, "mel_spec" : mel_spec}
+        return {"inputs" : neural_data, "targets" : targets, "wav_form" : wav, "mel_spec" : mel_spec, "target_len" : wav.shape[0]}
             
         
 
@@ -164,8 +175,43 @@ def _load_data_specific(data_path: str, X: list, Y: list, latent_timestep: int):
         data = np.load(npz_path)
         X.append(data["neural"])
         Y.append(data["latent"][latent_timestep])
+        
 
+def genereate_tokenized_latent(data_dir: str, model: EncodecModel):
+    
+    for dir_name in os.listdir(data_dir):
+        print(f"Converting {dir_name}")
+        dst_path = os.path.join(data_dir, dir_name)
+        for data_type in os.listdir(dst_path):
+            curr_path = os.path.join(dst_path, data_type)
+            for latent_data in os.listdir(curr_path):
+                if not latent_data.endswith(".npz"):
+                    continue
+                
+                # tokenize each latent variable
+                new_data = np.load(os.path.join(curr_path, latent_data))
+                latents = new_data["latent"]
 
+                conv_wavs =[] 
+                for latent in latents:
+                    wav = torch.from_numpy(latent).unsqueeze(0).unsqueeze(0).float()
+                    conv_wav = convert_audio(wav, SAMPLE_RATE, model.sample_rate, model.channels)
+                    conv_wavs.append(conv_wav)
+                with torch.no_grad():
+                    encoded_frames = model.encode(torch.cat([wav for wav in conv_wavs]))
+                codes = torch.cat([encoded[0] for encoded in encoded_frames], dim=-1)  # [B, n_q, T]
+
+                # need to save codes
+                torch.save({
+                    "tokenized_latent_var": codes,
+                    "model_sample_rate": model.sample_rate,
+                    "proper_length": latents.shape[1]
+                }, os.path.join(curr_path, latent_data.removesuffix(".npz") + "_tokenized.st"))
+                
 # main block to convert data from JSON to numpy files
-# if __name__ == "__main__":
+if __name__ == "__main__":
+
+    model = EncodecModel.encodec_model_24khz()
+    model.set_target_bandwidth(3)
+    genereate_tokenized_latent("/scratch/wongbr55/latent_mel_data", model)
 #     convert_json_to_npy("/scratch/wongbr55/latent_mel_data")
