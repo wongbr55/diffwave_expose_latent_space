@@ -52,16 +52,16 @@ class NeuralLatentDataset(Dataset):
         # Y = torch.from_numpy(Y)
 
         return {"inputs": X, "targets": Y, "target_len": Y.shape[0]}
-
+            
 
 class NeuralLatentWERDataset(Dataset):
-    def __init__(self, data_dir: str, latent_timestep: int):
+    def __init__(self, data_dir: str, latent_timestep: int, train_or_val: bool=False):
         super().__init__()
         self.files = []
         self.data_dir = data_dir
         self.latent_timestep = latent_timestep
 
-        data_type = "data_val"
+        data_type = "data_val" if not train_or_val else "data_train"
         for data_date in os.listdir(data_dir):
             date_path = os.path.join(data_dir, data_date)
             if not os.path.isdir(date_path):
@@ -75,7 +75,7 @@ class NeuralLatentWERDataset(Dataset):
             
             # there should 3 * W files in full_inter_path, where W = # of waveforms/sentences
             # to be "safe" we use the if condition to get out of the loop
-            for i in range(1, len(os.listdir(data_dir))):
+            for i in range(1, len(os.listdir(full_inter_path))):
                 wav_path = os.path.join(full_inter_path, f"sentence_{i}_neural_latent_data.npz")
                 mel_spec_path = os.path.join(full_inter_path, f"sentence_{i}.wav.spec.npy")
                 if not os.path.exists(wav_path) or not os.path.exists(mel_spec_path):
@@ -90,7 +90,7 @@ class NeuralLatentWERDataset(Dataset):
         npz_path = os.path.join(self.data_dir, wav_path)
         with np.load(npz_path) as data:
             neural_data = data["neural"].astype(np.float32)
-            if self.latent_timestep > 0:
+            if self.latent_timestep >= 0:
                 targets = data["latent"][self.latent_timestep]
             wav = data["latent"][0].astype(np.float32)
         mel_spec = np.load(mel_spec_path)
@@ -188,6 +188,10 @@ def genereate_tokenized_latent(data_dir: str, model: EncodecModel):
                 if not latent_data.endswith(".npz"):
                     continue
                 
+                save_file = latent_data.removesuffix(".npz") + "_tokenized.st"
+                if os.path.exists(os.path.join(curr_path, save_file)):
+                    continue
+                
                 # tokenize each latent variable
                 new_data = np.load(os.path.join(curr_path, latent_data))
                 latents = new_data["latent"]
@@ -206,7 +210,7 @@ def genereate_tokenized_latent(data_dir: str, model: EncodecModel):
                     "tokenized_latent_var": codes,
                     "model_sample_rate": model.sample_rate,
                     "proper_length": latents.shape[1]
-                }, os.path.join(curr_path, latent_data.removesuffix(".npz") + "_tokenized.st"))
+                }, os.path.join(curr_path, save_file))
                 
 # main block to convert data from JSON to numpy files
 if __name__ == "__main__":
