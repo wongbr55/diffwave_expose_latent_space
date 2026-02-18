@@ -121,7 +121,7 @@ class Decoder(nn.Module):
 
 
 class MelSpecModel(nn.Module):
-    def __init__(self, encoder: Encoder, decoder: Decoder):
+    def __init__(self, encoder: Encoder, decoder: Decoder, d_model):
         super().__init__()
         self.encoder = encoder
         self.decoder = decoder
