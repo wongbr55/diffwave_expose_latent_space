@@ -15,7 +15,8 @@ import pdb
 import json
 import os
 import whisper
-from jiwer import wer, Compose, ToLowerCase, RemovePunctuation, RemoveMultipleSpaces, Strip
+from jiwer import wer, Compose, ToLowerCase, RemovePunctuation, RemoveMultipleSpaces, Strip, process_words
+from scipy.io.wavfile import write
 
 from model_training import WHISPER_MODEL_PATH, WHISPER_SAMPLE_RATE, DIFFWAVE_MODEL_PATH, SAMPLE_RATE
 from diffwave.inference import predict
@@ -265,8 +266,9 @@ def val_loop_mel_spec(val_loader, model, device, stop_loss_threshold, sampler, e
     val_reg_sum  = torch.tensor(0.0, device=device)
     val_stop_sum = torch.tensor(0.0, device=device)
     val_count    = torch.tensor(0.0, device=device)
-    wer_score_total = torch.zeros(1, device=device)
+    total_errors = torch.zeros(1, device=device)
     loop_iteration = 0
+    total_gt_words = torch.zeros(1, device=device)
     with torch.no_grad():
         for inputs, input_lengths, targets, target_lengths, wavs, stop_targets in val_loader:
             if rank == 0:
@@ -288,7 +290,7 @@ def val_loop_mel_spec(val_loader, model, device, stop_loss_threshold, sampler, e
                 # use STT to get words spoken
                 # can squeeze because first dimension of audio is 1 (batch size)
                 audio = audio.squeeze(0)
-                wav_tensor = torch.tensor(wavs[i], dtype=torch.float32)  # convert to float tens
+                wav_tensor = torch.tensor(wavs[i], dtype=torch.float32)  # convert to float tens                
                 gt_audio_16k = torchaudio.functional.resample(wav_tensor, SAMPLE_RATE, WHISPER_SAMPLE_RATE)
                 gen_audio_16k = torchaudio.functional.resample(audio, SAMPLE_RATE, WHISPER_SAMPLE_RATE)
                 gt_speech = stt_model.transcribe(
@@ -296,14 +298,17 @@ def val_loop_mel_spec(val_loader, model, device, stop_loss_threshold, sampler, e
                     language="en",
                     task="transcribe"
                     )["text"]
-
                 gen_speech = stt_model.transcribe(
                     gen_audio_16k.cpu().numpy().astype("float32"),
                     language="en",
                     task="transcribe"
                 )["text"]
-                wer_score_total += wer(gt_speech, gen_speech)#, reference_transform=transform, hypothesis_transform=transform)
-            
+                
+                out = process_words(gt_speech, gen_speech)
+
+                errors = out.substitutions + out.deletions + out.insertions
+                total_errors += errors
+                total_gt_words += len(gt_speech.split())
             
             T_pred = preds.size(1)
             mask = torch.arange(T_pred, device=device)[None, :] < (target_lengths[:, None])
@@ -334,14 +339,16 @@ def val_loop_mel_spec(val_loader, model, device, stop_loss_threshold, sampler, e
     dist.all_reduce(val_reg_sum,  op=dist.ReduceOp.SUM)
     dist.all_reduce(val_stop_sum, op=dist.ReduceOp.SUM)
     dist.all_reduce(val_count,    op=dist.ReduceOp.SUM)
-    dist.all_reduce(wer_score_total, op=dist.ReduceOp.SUM)
+    dist.all_reduce(total_errors, op=dist.ReduceOp.SUM)
+    dist.all_reduce(total_gt_words, op=dist.ReduceOp.SUM)
 
     return (
         val_loss_sum.item(),
         val_reg_sum.item(),
         val_stop_sum.item(),
         val_count.item(),
-        wer_score_total
+        total_errors,
+        total_gt_words
     )
 
 if __name__ == "__main__":
@@ -425,9 +432,8 @@ if __name__ == "__main__":
         if rank == 0:
             print(f"##############")
             print(f"Starting epoch {epoch}")
-        
         train_loss_sum, train_reg_sum, train_stop_sum, train_count = train_loop_mel_spec(train_loader, model, device, optimizer, stop_threshold, train_sampler, epoch)
-        val_loss_sum, val_reg_sum, val_stop_sum, val_count, wer_score_total = val_loop_mel_spec(val_loader, model, device, stop_threshold, val_sampler, epoch)
+        val_loss_sum, val_reg_sum, val_stop_sum, val_count, wer_score_total, total_gt_words = val_loop_mel_spec(val_loader, model, device, stop_threshold, val_sampler, epoch)
         
         avg_train_loss = train_loss_sum / train_count
         avg_train_reg = train_reg_sum / train_count
@@ -444,7 +450,7 @@ if __name__ == "__main__":
         val_total_loss.append(avg_val_loss)
         val_reg_loss.append(avg_val_reg)
         val_stop_loss.append(avg_val_stop)
-        val_wer_score.append(wer_score_total / val_count)
+        val_wer_score.append(wer_score_total / total_gt_words)
         
         
         if rank == 0:
