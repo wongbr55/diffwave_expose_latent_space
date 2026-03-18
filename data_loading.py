@@ -87,8 +87,7 @@ class NeuralLatentWERDataset(Dataset):
     
     def __getitem__(self, index):
         wav_path, mel_spec_path = self.files[index]
-        npz_path = os.path.join(self.data_dir, wav_path)
-        with np.load(npz_path) as data:
+        with np.load(wav_path) as data:
             neural_data = data["neural"].astype(np.float32)
             if self.latent_timestep >= 0:
                 targets = data["latent"][self.latent_timestep]
@@ -98,7 +97,49 @@ class NeuralLatentWERDataset(Dataset):
         
         return {"inputs" : neural_data, "targets" : targets, "wav_form" : wav, "mel_spec" : mel_spec, "target_len" : wav.shape[0]}
             
+
+class TokenizedDataset(Dataset):
+    def __init__(self, data_dir: str, latent_timestep: int, train_or_val: bool=False):
+        super().__init__()
+        self.files = []
+        self.data_dir = data_dir
+        self.latent_timestep = latent_timestep
+
+        data_type = "data_val" if not train_or_val else "data_train"
+        for data_date in os.listdir(data_dir):
+            date_path = os.path.join(data_dir, data_date)
+            if not os.path.isdir(date_path):
+                continue
+
+            inter_path = os.path.join(data_date, data_type)
+            full_inter_path = os.path.join(data_dir, inter_path)
+
+            if not os.path.isdir(full_inter_path):
+                continue
+            
+            # there should 4 * W files in full_inter_path, where W = # of waveforms/sentences
+            # to be "safe" we use the if condition to get out of the loop
+            for i in range(1, len(os.listdir(full_inter_path))):
+                token_wav_path = os.path.join(full_inter_path, f"sentence_{i}_neural_latent_data_tokenized.st")
+                wav_path = os.path.join(full_inter_path, f"sentence_{i}_neural_latent_data.npz")
+                mel_spec_path = os.path.join(full_inter_path, f"sentence_{i}.wav.spec.npy")
+                if not os.path.exists(wav_path) or not os.path.exists(mel_spec_path):
+                    break
+                self.files.append((wav_path, token_wav_path, mel_spec_path))
+    
+    def __len__(self):
+        return len(self.files)
+
+    def __getitem__(self, index):
+        wav_path, token_wav_path, mel_spec_path = self.files[index]
+        with np.load(wav_path) as data:
+            neural_data = data["neural"].astype(np.float32)
+            gt_latent_waveform = data["latent"][self.latent_timestep]
+            gt_waveform = data["latent"][0]
+        mel_spec = np.load(mel_spec_path)
+        tokenized_data = torch.load(token_wav_path)["tokenized_latent_var"][self.latent_timestep]
         
+        return {"inputs" : neural_data, "targets" : tokenized_data, "wav_form" : gt_waveform, "latent_waveform" : gt_latent_waveform, "mel_spec" : mel_spec}        
 
 def construct_latent_dataset(data_dir: str, latent_timestep: int):
     
@@ -213,9 +254,9 @@ def genereate_tokenized_latent(data_dir: str, model: EncodecModel):
                 }, os.path.join(curr_path, save_file))
                 
 # main block to convert data from JSON to numpy files
-if __name__ == "__main__":
+# if __name__ == "__main__":
 
-    model = EncodecModel.encodec_model_24khz()
-    model.set_target_bandwidth(3)
-    genereate_tokenized_latent("/scratch/wongbr55/latent_mel_data", model)
+#     model = EncodecModel.encodec_model_24khz()
+#     model.set_target_bandwidth(3)
+#     genereate_tokenized_latent("/scratch/wongbr55/latent_mel_data", model)
 #     convert_json_to_npy("/scratch/wongbr55/latent_mel_data")

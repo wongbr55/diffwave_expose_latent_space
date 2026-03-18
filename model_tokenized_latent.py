@@ -1,3 +1,5 @@
+import torch._dynamo
+torch._dynamo.disable()
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -6,7 +8,7 @@ from torch.utils.data import DistributedSampler
 import torchaudio
 
 import numpy as np
-from data_loading import construct_latent_dataset, NeuralLatentWERDataset
+from data_loading import TokenizedDataset, SAMPLE_RATE
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader
 from torch.optim import AdamW
@@ -15,13 +17,17 @@ import pdb
 import json
 import os
 import whisper
-from jiwer import wer, Compose, ToLowerCase, RemovePunctuation, RemoveMultipleSpaces, Strip, process_words
-from scipy.io.wavfile import write
+from jiwer import wer, process_words
 
 from model_training import WHISPER_MODEL_PATH, WHISPER_SAMPLE_RATE, DIFFWAVE_MODEL_PATH, SAMPLE_RATE
 from diffwave.inference import predict
 
-MEL_SPEC_COL_LEN = 80
+from encodec.utils import convert_audio
+from encodec import EncodecModel
+
+TOKEN_CLASSES = 1024
+NUM_RESIDUALS = 4
+PAD_TOKEN = 1024
 
 def setup_ddp(rank, world_size):
     dist.init_process_group(
@@ -93,13 +99,9 @@ class Decoder(nn.Module):
             num_layers=n_layers
         )
         
-        self.lm_head = nn.Linear(d_model, output_size)
+        self.token_out = nn.Linear(d_model, TOKEN_CLASSES * NUM_RESIDUALS)
 
     def forward(self, tgt_tokens, memory):
-        """
-        tgt_tokens: (B, T)
-        memory:     (B, S, d_model)  # encoder output
-        """
         B, T, __ = tgt_tokens.shape
         
         tgt = self.input_proj(tgt_tokens)
@@ -117,11 +119,12 @@ class Decoder(nn.Module):
             tgt_mask=tgt_mask
         )
         
-        logits = self.lm_head(out)
-        return logits, out
+        logits = self.token_out(out)
+        
+        return logits.view(B, T, NUM_RESIDUALS, TOKEN_CLASSES), out
 
 
-class MelSpecModel(nn.Module):
+class TokenizedAudioModel(nn.Module):
     def __init__(self, encoder: Encoder, decoder: Decoder, d_model):
         super().__init__()
         self.encoder = encoder
@@ -139,14 +142,15 @@ class MelSpecModel(nn.Module):
             logits: (B, T, vocab_size)
         """
         # Encode
+        tgt_tokens = tgt_tokens.float()
         B = src.shape[0]
         memory, _ = self.encoder(src, src_lengths)
-        mel_preds, hidden = self.decoder(tgt_tokens, memory)
+        preds, hidden = self.decoder(tgt_tokens, memory)
         stop_logits = self.stop_head(hidden).squeeze(-1)
-        return mel_preds, stop_logits
+        return preds, stop_logits
 
 
-def collate_fn_mel_spec(batch):
+def collate_fn_token_audio(batch):
 
     inputs = [
         torch.from_numpy(b["inputs"]).float()
@@ -166,7 +170,7 @@ def collate_fn_mel_spec(batch):
 
     # -------- decoder targets --------
     targets = [
-        torch.from_numpy(b["mel_spec"]).float().transpose(0, 1)
+        b["targets"].long().T
         for b in batch
     ]
     
@@ -174,23 +178,22 @@ def collate_fn_mel_spec(batch):
         [y.size(0) for y in targets],
         dtype=torch.long
     )
-    # (B, T_out_max, output_dim) or (B, T_out_max)
+    # (B, T_out_max, Token_dim) 
     targets = pad_sequence(
         targets,
         batch_first=True,
-        padding_value=0.0
+        padding_value = PAD_TOKEN
     ).contiguous()
     
-    
-    lengths = torch.tensor([b["mel_spec"].shape[1] for b in batch])
+    lengths = torch.tensor([b["targets"].shape[1] for b in batch])
     max_len = lengths.max()
     stop_targets = torch.zeros(len(batch), max_len)
     for i, L in enumerate(lengths):
         stop_targets[i, L-1] = 1.0
     
-    return inputs, input_lengths, targets, target_lengths, [b["wav_form"] for b in batch], stop_targets
+    return inputs, input_lengths, targets, target_lengths, [b["wav_form"] for b in batch], stop_targets, [torch.from_numpy(b["mel_spec"]) for b in batch]
 
-def train_loop_mel_spec(train_loader, model, device, optimizer, stop_loss_threshold, sampler, epoch):
+def train_loop_token_audio(train_loader, model, device, optimizer, stop_loss_threshold, sampler, epoch):
     model.train()
     sampler.set_epoch(epoch)
     train_loss_sum = torch.tensor(0.0, device=device)
@@ -199,7 +202,7 @@ def train_loop_mel_spec(train_loader, model, device, optimizer, stop_loss_thresh
     train_count    = torch.tensor(0.0, device=device)
 
     loop_counter = 0
-    for inputs, input_lengths, targets, target_lengths, wavs, stop_targets in train_loader:
+    for inputs, input_lengths, targets, target_lengths, wavs, stop_targets, mel_spec in train_loader:
         if rank == 0:
             print(f"Training loop iteration {loop_counter}")
         loop_counter += 1
@@ -212,19 +215,25 @@ def train_loop_mel_spec(train_loader, model, device, optimizer, stop_loss_thresh
 
         optimizer.zero_grad()
         
-        bos = torch.zeros(inputs.shape[0], 1, MEL_SPEC_COL_LEN, device=targets.device)
-        decoder_input  = torch.cat([bos, targets[:, :-1]], dim=1)
+        bos = torch.full(
+            (targets.shape[0], 1, NUM_RESIDUALS),
+            0,
+            device=targets.device
+        )
+        decoder_input = torch.cat([bos, targets[:, :-1, :]], dim=1)
         preds, stop_logits = model(inputs, input_lengths, decoder_input)
         
         T_pred = preds.size(1)
 
         mask = torch.arange(T_pred, device=device)[None, :] < (target_lengths[:, None])
         num_valid = mask.sum()
+        targets = targets.permute(0, 2, 1)
+        B, T, R, C = preds.shape
 
-        reg_loss = F.mse_loss(
-            preds[mask],
-            targets[:, :T_pred][mask],
-            reduction="sum"
+        reg_loss = F.cross_entropy(
+            preds.reshape(B*T*R, C),
+            targets.reshape(B*T*R),
+            ignore_index=PAD_TOKEN
         )
 
         last_mask = torch.arange(T_pred, device=device)[None, :] == (target_lengths[:, None] - 1)
@@ -257,7 +266,7 @@ def train_loop_mel_spec(train_loader, model, device, optimizer, stop_loss_thresh
         train_count.item()
     )
 
-def val_loop_mel_spec(val_loader, model, device, stop_loss_threshold, sampler, epoch):
+def val_loop_token_audio(val_loader, model, device, stop_loss_threshold, sampler, epoch, encodec_model, latent_timestep):
     model.eval()
     stt_model = whisper.load_model(WHISPER_MODEL_PATH)
     sampler.set_epoch(epoch)
@@ -270,7 +279,7 @@ def val_loop_mel_spec(val_loader, model, device, stop_loss_threshold, sampler, e
     loop_iteration = 0
     total_gt_words = torch.zeros(1, device=device)
     with torch.no_grad():
-        for inputs, input_lengths, targets, target_lengths, wavs, stop_targets in val_loader:
+        for  inputs, input_lengths, targets, target_lengths, wavs, stop_targets, mel_spec in val_loader:
             if rank == 0:
                 print(f"Val loop iteration {loop_iteration}")
             loop_iteration += 1
@@ -279,18 +288,30 @@ def val_loop_mel_spec(val_loader, model, device, stop_loss_threshold, sampler, e
             target_lengths = target_lengths.to(device)
             stop_targets = stop_targets.to(device)
 
-            bos = torch.zeros(inputs.shape[0], 1, MEL_SPEC_COL_LEN, device=targets.device)
-            decoder_input  = torch.cat([bos, targets[:, :-1]], dim=1)
+            bos = torch.full(
+                (targets.shape[0], 1, NUM_RESIDUALS),
+                0,
+                device=targets.device
+            )
+            decoder_input = torch.cat([bos, targets[:, :-1, :]], dim=1)
             preds, stop_logits = model(inputs, input_lengths, decoder_input)
                         
             # preds = prepare_decoder_preds_for_diffwave(preds)
             # PERFORM WER CALC ON PREDICTED
             for i in range(0, preds.shape[0]):
-                audio, __, __ = predict(preds[i].transpose(0, 1), DIFFWAVE_MODEL_PATH)
+                codes = preds[i].argmax(dim=-1).permute(1, 0).unsqueeze(0).to(device)
+                scale = torch.tensor(1.0, device=codes.device)
+                encoded_frames = [(codes, scale)]
+                gen_wav = encodec_model.decode(encoded_frames)
+                gen_wav = gen_wav.cpu()
+                gen_wav = convert_audio(gen_wav, encodec_model.sample_rate, SAMPLE_RATE, 1)
+                gen_wav = gen_wav[..., :wavs[i].shape[-1]].squeeze(1)
+                gen_wav = gen_wav.to(device)
+                audio, __, __ = predict(mel_spec[i], DIFFWAVE_MODEL_PATH, inject_latent_var=(latent_timestep, gen_wav))
                 # use STT to get words spoken
                 # can squeeze because first dimension of audio is 1 (batch size)
                 audio = audio.squeeze(0)
-                wav_tensor = torch.tensor(wavs[i], dtype=torch.float32)  # convert to float tens                
+                wav_tensor = torch.tensor(wavs[i], dtype=torch.float32)  # convert to float tens
                 gt_audio_16k = torchaudio.functional.resample(wav_tensor, SAMPLE_RATE, WHISPER_SAMPLE_RATE)
                 gen_audio_16k = torchaudio.functional.resample(audio, SAMPLE_RATE, WHISPER_SAMPLE_RATE)
                 gt_speech = stt_model.transcribe(
@@ -298,12 +319,12 @@ def val_loop_mel_spec(val_loader, model, device, stop_loss_threshold, sampler, e
                     language="en",
                     task="transcribe"
                     )["text"]
+
                 gen_speech = stt_model.transcribe(
                     gen_audio_16k.cpu().numpy().astype("float32"),
                     language="en",
                     task="transcribe"
                 )["text"]
-                
                 out = process_words(gt_speech, gen_speech)
 
                 errors = out.substitutions + out.deletions + out.insertions
@@ -313,11 +334,13 @@ def val_loop_mel_spec(val_loader, model, device, stop_loss_threshold, sampler, e
             T_pred = preds.size(1)
             mask = torch.arange(T_pred, device=device)[None, :] < (target_lengths[:, None])
             num_valid = mask.sum()
-            
-            reg_loss = F.mse_loss(
-                preds[mask],
-                targets[:, :T_pred][mask],
-                reduction="sum"
+            targets = targets.permute(0, 2, 1)
+            B, T, R, C = preds.shape
+
+            reg_loss = F.cross_entropy(
+                preds.reshape(B*T*R, C),
+                targets.reshape(B*T*R),
+                ignore_index=PAD_TOKEN
             )
 
             last_mask = torch.arange(T_pred, device=device)[None, :] == (target_lengths[:, None] - 1)
@@ -339,38 +362,59 @@ def val_loop_mel_spec(val_loader, model, device, stop_loss_threshold, sampler, e
     dist.all_reduce(val_reg_sum,  op=dist.ReduceOp.SUM)
     dist.all_reduce(val_stop_sum, op=dist.ReduceOp.SUM)
     dist.all_reduce(val_count,    op=dist.ReduceOp.SUM)
-    dist.all_reduce(total_errors, op=dist.ReduceOp.SUM)
     dist.all_reduce(total_gt_words, op=dist.ReduceOp.SUM)
+    dist.all_reduce(total_errors, op=dist.ReduceOp.SUM)
 
     return (
         val_loss_sum.item(),
         val_reg_sum.item(),
         val_stop_sum.item(),
         val_count.item(),
-        total_errors,
-        total_gt_words
+        total_errors.item(),
+        total_gt_words.item()
     )
 
 if __name__ == "__main__":
     rank = int(os.environ["LOCAL_RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
     setup_ddp(rank, world_size)
+    device = torch.device(f"cuda:{rank}")
+    latent_timestep = 3
     
-    MODEL_NAME = "mel_spec_model"
+    
     INPUT_DIM = 512
+    # PARAMS FOR token_audio_model_latent_X and token_audio_model which is latent timestep 0
+    # MODEL_NAME = f"token_audio_model_latent_{latent_timestep}"
+    # d_model = 128
+    # num_epochs = 100
+    # stop_threshold = 2
+    # batch_size = 128
+    # 
+    # local_batch_size = batch_size // world_size
+    
+    # encoder = Encoder(INPUT_DIM, 2, 4, d_model)
+    # decoder = Decoder(NUM_RESIDUALS, n_heads=2, n_layers=4, d_model=d_model)
+    # model = TokenizedAudioModel(encoder, decoder, d_model)
+    
+    # PARAMS FOR token_audio_small_model_latent_X
+    MODEL_NAME = f"token_audio_small_model_latent_{latent_timestep}"
     d_model = 128
-    num_epochs = 20
+    num_epochs = 100
     stop_threshold = 2
     batch_size = 128
-    device = torch.device(f"cuda:{rank}")
+    
     local_batch_size = batch_size // world_size
     
-    encoder = Encoder(INPUT_DIM, 2, 4, d_model)
-    decoder = Decoder(MEL_SPEC_COL_LEN, n_heads=2, n_layers=4, d_model=d_model)
-    model = MelSpecModel(encoder, decoder, d_model=d_model)
+    encoder = Encoder(INPUT_DIM, 2, 2, d_model)
+    decoder = Decoder(NUM_RESIDUALS, n_heads=2, n_layers=2, d_model=d_model)
+    model = TokenizedAudioModel(encoder, decoder, d_model)
     
+    encodec_model = EncodecModel.encodec_model_24khz()
+    encodec_model.set_target_bandwidth(3)
+    encodec_model = encodec_model.to(device)
     
-    model = model.to(rank)
+    # model = model.to('cuda' if torch.cuda.is_available() else 'cpu')
+    model = model.to(device)
     model = torch.nn.parallel.DistributedDataParallel(
         model,
         device_ids=[rank],
@@ -378,8 +422,8 @@ if __name__ == "__main__":
     )
     optimizer = AdamW(model.parameters(), lr=5e-4)
     
-    train_dataset = NeuralLatentWERDataset("/scratch/wongbr55/latent_mel_data", train_or_val=True, latent_timestep=0)
-    val_dataset = NeuralLatentWERDataset("/scratch/wongbr55/latent_mel_data", train_or_val=False, latent_timestep=0)
+    train_dataset = TokenizedDataset("/scratch/wongbr55/latent_mel_data", train_or_val=True, latent_timestep=latent_timestep)
+    val_dataset = TokenizedDataset("/scratch/wongbr55/latent_mel_data", train_or_val=False, latent_timestep=latent_timestep)
     
     train_sampler = DistributedSampler(
         train_dataset,
@@ -398,7 +442,7 @@ if __name__ == "__main__":
         train_dataset,
         batch_size=local_batch_size,
         shuffle=False,
-        collate_fn=collate_fn_mel_spec,
+        collate_fn=collate_fn_token_audio,
         pin_memory=True,
         persistent_workers=True,
         num_workers = 4,
@@ -409,7 +453,7 @@ if __name__ == "__main__":
         val_dataset,
         batch_size=local_batch_size,
         shuffle=False,
-        collate_fn=collate_fn_mel_spec,
+        collate_fn=collate_fn_token_audio,
         pin_memory=True,
         persistent_workers=True,
         num_workers = 4,
@@ -432,8 +476,9 @@ if __name__ == "__main__":
         if rank == 0:
             print(f"##############")
             print(f"Starting epoch {epoch}")
-        train_loss_sum, train_reg_sum, train_stop_sum, train_count = train_loop_mel_spec(train_loader, model, device, optimizer, stop_threshold, train_sampler, epoch)
-        val_loss_sum, val_reg_sum, val_stop_sum, val_count, wer_score_total, total_gt_words = val_loop_mel_spec(val_loader, model, device, stop_threshold, val_sampler, epoch)
+        
+        train_loss_sum, train_reg_sum, train_stop_sum, train_count = train_loop_token_audio(train_loader, model, device, optimizer, stop_threshold, train_sampler, epoch)
+        val_loss_sum, val_reg_sum, val_stop_sum, val_count, wer_score_total, total_gt_words = val_loop_token_audio(val_loader, model, device, stop_threshold, val_sampler, epoch, encodec_model, latent_timestep)
         
         avg_train_loss = train_loss_sum / train_count
         avg_train_reg = train_reg_sum / train_count
