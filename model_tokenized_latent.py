@@ -374,6 +374,15 @@ def val_loop_token_audio(val_loader, model, device, stop_loss_threshold, sampler
         total_gt_words.item()
     )
 
+
+def create_latent_model():
+    INPUT_DIM = 512
+    d_model = 128
+    encoder = Encoder(INPUT_DIM, 2, 4, d_model)
+    decoder = Decoder(NUM_RESIDUALS, n_heads=2, n_layers=4, d_model=d_model)
+    model = TokenizedAudioModel(encoder, decoder, d_model)
+    return model
+
 if __name__ == "__main__":
     rank = int(os.environ["LOCAL_RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
@@ -389,25 +398,38 @@ if __name__ == "__main__":
     # num_epochs = 100
     # stop_threshold = 2
     # batch_size = 128
-    # 
+    
     # local_batch_size = batch_size // world_size
     
     # encoder = Encoder(INPUT_DIM, 2, 4, d_model)
     # decoder = Decoder(NUM_RESIDUALS, n_heads=2, n_layers=4, d_model=d_model)
     # model = TokenizedAudioModel(encoder, decoder, d_model)
     
-    # PARAMS FOR token_audio_small_model_latent_X
-    MODEL_NAME = f"token_audio_small_model_latent_{latent_timestep}"
-    d_model = 128
+    # PARAMS FOR token_audio_model_med_latent_X 
+    MODEL_NAME = f"token_audio_model_med_latent_{latent_timestep}"
+    d_model = 256
     num_epochs = 100
     stop_threshold = 2
     batch_size = 128
     
     local_batch_size = batch_size // world_size
     
-    encoder = Encoder(INPUT_DIM, 2, 2, d_model)
-    decoder = Decoder(NUM_RESIDUALS, n_heads=2, n_layers=2, d_model=d_model)
+    encoder = Encoder(INPUT_DIM, 3, 6, d_model)
+    decoder = Decoder(NUM_RESIDUALS, n_heads=3, n_layers=6, d_model=d_model)
     model = TokenizedAudioModel(encoder, decoder, d_model)
+    
+    # PARAMS FOR token_audio_small_model_latent_X
+    # MODEL_NAME = f"token_audio_small_model_latent_{latent_timestep}"
+    # d_model = 128
+    # num_epochs = 100
+    # stop_threshold = 2
+    # batch_size = 128
+    
+    # local_batch_size = batch_size // world_size
+    
+    # encoder = Encoder(INPUT_DIM, 2, 2, d_model)
+    # decoder = Decoder(NUM_RESIDUALS, n_heads=2, n_layers=2, d_model=d_model)
+    # model = TokenizedAudioModel(encoder, decoder, d_model)
     
     encodec_model = EncodecModel.encodec_model_24khz()
     encodec_model.set_target_bandwidth(3)

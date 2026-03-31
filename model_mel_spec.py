@@ -350,6 +350,16 @@ def val_loop_mel_spec(val_loader, model, device, stop_loss_threshold, sampler, e
         total_errors,
         total_gt_words
     )
+    
+def create_mel_model():
+        
+    INPUT_DIM = 512
+    d_model = 128
+    encoder = Encoder(INPUT_DIM, 2, 4, d_model)
+    decoder = Decoder(MEL_SPEC_COL_LEN, n_heads=2, n_layers=4, d_model=d_model)
+    model = MelSpecModel(encoder, decoder, d_model=d_model)
+    return model
+    
 
 if __name__ == "__main__":
     rank = int(os.environ["LOCAL_RANK"])
