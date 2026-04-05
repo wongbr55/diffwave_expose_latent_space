@@ -140,6 +140,7 @@ class MelSpecModel(nn.Module):
         """
         # Encode
         B = src.shape[0]
+        tgt_tokens = tgt_tokens.float()
         memory, _ = self.encoder(src, src_lengths)
         mel_preds, hidden = self.decoder(tgt_tokens, memory)
         stop_logits = self.stop_head(hidden).squeeze(-1)
@@ -190,7 +191,7 @@ def collate_fn_mel_spec(batch):
     
     return inputs, input_lengths, targets, target_lengths, [b["wav_form"] for b in batch], stop_targets
 
-def train_loop_mel_spec(train_loader, model, device, optimizer, stop_loss_threshold, sampler, epoch):
+def train_loop_mel_spec(train_loader, model, device, optimizer, stop_loss_threshold, sampler, epoch, initial_ratio, final_ratio):
     model.train()
     sampler.set_epoch(epoch)
     train_loss_sum = torch.tensor(0.0, device=device)
@@ -198,6 +199,8 @@ def train_loop_mel_spec(train_loader, model, device, optimizer, stop_loss_thresh
     train_stop_sum = torch.tensor(0.0, device=device)
     train_count    = torch.tensor(0.0, device=device)
 
+    teacher_forcing_ratio = initial_ratio - (initial_ratio - final_ratio) * (epoch / num_epochs)
+    teacher_forcing_ratio = max(final_ratio, teacher_forcing_ratio)
     loop_counter = 0
     for inputs, input_lengths, targets, target_lengths, wavs, stop_targets in train_loader:
         if rank == 0:
@@ -214,24 +217,48 @@ def train_loop_mel_spec(train_loader, model, device, optimizer, stop_loss_thresh
         
         bos = torch.zeros(inputs.shape[0], 1, MEL_SPEC_COL_LEN, device=targets.device)
         decoder_input  = torch.cat([bos, targets[:, :-1]], dim=1)
-        preds, stop_logits = model(inputs, input_lengths, decoder_input)
-        
-        T_pred = preds.size(1)
+        # Encode once
+        memory, _ = model.module.encoder(inputs, input_lengths)
 
-        mask = torch.arange(T_pred, device=device)[None, :] < (target_lengths[:, None])
+        B, T, D = targets.shape
+
+        # BOS
+        bos = torch.zeros(B, 1, D, device=device)
+
+        # ---- PASS 1: teacher-forced (NO grad) ----
+        gt_input = torch.cat([bos, targets[:, :-1]], dim=1)
+
+        with torch.no_grad():
+            preds_tf, hidden_tf = model.module.decoder(gt_input, memory)
+            # preds_tf: [B, T, F]
+
+        # ---- MIX teacher forcing ----
+        use_tf = (torch.rand(B, T, device=device) < teacher_forcing_ratio).unsqueeze(-1)  # [B, T, 1]
+
+        mixed = torch.where(use_tf, targets, preds_tf)  # [B, T, F]
+
+        # Shift for decoder input
+        decoder_input = torch.cat([bos, mixed[:, :-1]], dim=1)
+
+        # ---- PASS 2: real forward (WITH grad) ----
+        preds, hidden = model.module.decoder(decoder_input, memory)
+        stop_logits = model.module.stop_head(hidden).squeeze(-1)
+        
+
+        mask = torch.arange(T, device=device)[None, :] < (target_lengths[:, None])
         num_valid = mask.sum()
 
         reg_loss = F.mse_loss(
             preds[mask],
-            targets[:, :T_pred][mask],
+            targets[:, :T][mask],
             reduction="sum"
         )
 
-        last_mask = torch.arange(T_pred, device=device)[None, :] == (target_lengths[:, None] - 1)
+        last_mask = torch.arange(T, device=device)[None, :] == (target_lengths[:, None] - 1)
 
         stop_loss = F.binary_cross_entropy_with_logits(
             stop_logits[last_mask],
-            stop_targets[:, :T_pred][last_mask],
+            stop_targets[:, :T][last_mask],
             reduction="sum"
         )
 
@@ -366,7 +393,7 @@ if __name__ == "__main__":
     world_size = int(os.environ["WORLD_SIZE"])
     setup_ddp(rank, world_size)
     
-    MODEL_NAME = "mel_spec_model"
+    MODEL_NAME = "mel_spec_model_mixed"
     INPUT_DIM = 512
     d_model = 128
     num_epochs = 20
@@ -437,12 +464,14 @@ if __name__ == "__main__":
     
     
     os.makedirs(f"/scratch/wongbr55/{MODEL_NAME}", exist_ok=True)
-    
+     # use mixed teacher forcing
+    initial_ratio = 1.0      # start fully teacher forcing
+    final_ratio   = 0.1
     for epoch in range(num_epochs):
         if rank == 0:
             print(f"##############")
             print(f"Starting epoch {epoch}")
-        train_loss_sum, train_reg_sum, train_stop_sum, train_count = train_loop_mel_spec(train_loader, model, device, optimizer, stop_threshold, train_sampler, epoch)
+        train_loss_sum, train_reg_sum, train_stop_sum, train_count = train_loop_mel_spec(train_loader, model, device, optimizer, stop_threshold, train_sampler, epoch, initial_ratio, final_ratio)
         val_loss_sum, val_reg_sum, val_stop_sum, val_count, wer_score_total, total_gt_words = val_loop_mel_spec(val_loader, model, device, stop_threshold, val_sampler, epoch)
         
         avg_train_loss = train_loss_sum / train_count
@@ -463,7 +492,7 @@ if __name__ == "__main__":
         val_wer_score.append(wer_score_total / total_gt_words)
         
         
-        if rank == 0:
+        if rank == 0 and epoch >= 99:
             torch.save({
             "epoch": epoch,
             "model_state_dict": model.state_dict(),

@@ -102,6 +102,7 @@ class Decoder(nn.Module):
         self.token_out = nn.Linear(d_model, TOKEN_CLASSES * NUM_RESIDUALS)
 
     def forward(self, tgt_tokens, memory):
+        tgt_tokens = tgt_tokens.float()
         B, T, __ = tgt_tokens.shape
         
         tgt = self.input_proj(tgt_tokens)
@@ -193,7 +194,7 @@ def collate_fn_token_audio(batch):
     
     return inputs, input_lengths, targets, target_lengths, [b["wav_form"] for b in batch], stop_targets, [torch.from_numpy(b["mel_spec"]) for b in batch]
 
-def train_loop_token_audio(train_loader, model, device, optimizer, stop_loss_threshold, sampler, epoch):
+def train_loop_token_audio(train_loader, model, device, optimizer, stop_loss_threshold, sampler, epoch, initial_ratio, final_ratio):
     model.train()
     sampler.set_epoch(epoch)
     train_loss_sum = torch.tensor(0.0, device=device)
@@ -201,12 +202,13 @@ def train_loop_token_audio(train_loader, model, device, optimizer, stop_loss_thr
     train_stop_sum = torch.tensor(0.0, device=device)
     train_count    = torch.tensor(0.0, device=device)
 
+    teacher_forcing_ratio = initial_ratio - (initial_ratio - final_ratio) * (epoch / num_epochs)
+    teacher_forcing_ratio = max(final_ratio, teacher_forcing_ratio)
     loop_counter = 0
     for inputs, input_lengths, targets, target_lengths, wavs, stop_targets, mel_spec in train_loader:
         if rank == 0:
             print(f"Training loop iteration {loop_counter}")
         loop_counter += 1
-
         inputs = inputs.to(device)
         input_lengths = input_lengths.to(device)
         targets = targets.to(device)
@@ -220,12 +222,33 @@ def train_loop_token_audio(train_loader, model, device, optimizer, stop_loss_thr
             0,
             device=targets.device
         )
-        decoder_input = torch.cat([bos, targets[:, :-1, :]], dim=1)
-        preds, stop_logits = model(inputs, input_lengths, decoder_input)
-        
-        T_pred = preds.size(1)
+        B, T, R = targets.shape
+        # Encode once
+        memory, _ = model.module.encoder(inputs, input_lengths)
 
-        mask = torch.arange(T_pred, device=device)[None, :] < (target_lengths[:, None])
+        # BOS
+        bos = torch.zeros(B, 1, R, device=device, dtype=targets.dtype)
+
+        # ---- PASS 1: teacher-forced (NO grad) ----
+        gt_input = torch.cat([bos, targets[:, :-1]], dim=1)
+
+        with torch.no_grad():
+            preds_tf, _ = model.module.decoder(gt_input.float(), memory)
+            pred_tokens = preds_tf.argmax(dim=-1)  # [B, T, R]
+
+        # ---- MIX teacher forcing ----
+        use_tf = (torch.rand(B, T, device=device) < teacher_forcing_ratio).unsqueeze(-1)
+
+        mixed_tokens = torch.where(use_tf, targets, pred_tokens)
+
+        # Shift again for decoder input
+        decoder_input = torch.cat([bos, mixed_tokens[:, :-1]], dim=1)
+
+        # ---- PASS 2: real forward (WITH grad) ----
+        preds, hidden = model.module.decoder(decoder_input.float(), memory)
+        stop_logits = model.module.stop_head(hidden).squeeze(-1)
+        
+        mask = torch.arange(T, device=device)[None, :] < (target_lengths[:, None])
         num_valid = mask.sum()
         targets = targets.permute(0, 2, 1)
         B, T, R, C = preds.shape
@@ -236,11 +259,11 @@ def train_loop_token_audio(train_loader, model, device, optimizer, stop_loss_thr
             ignore_index=PAD_TOKEN
         )
 
-        last_mask = torch.arange(T_pred, device=device)[None, :] == (target_lengths[:, None] - 1)
+        last_mask = torch.arange(T, device=device)[None, :] == (target_lengths[:, None] - 1)
 
         stop_loss = F.binary_cross_entropy_with_logits(
             stop_logits[last_mask],
-            stop_targets[:, :T_pred][last_mask],
+            stop_targets[:, :T][last_mask],
             reduction="sum"
         )
 
@@ -279,7 +302,7 @@ def val_loop_token_audio(val_loader, model, device, stop_loss_threshold, sampler
     loop_iteration = 0
     total_gt_words = torch.zeros(1, device=device)
     with torch.no_grad():
-        for  inputs, input_lengths, targets, target_lengths, wavs, stop_targets, mel_spec in val_loader:
+        for inputs, input_lengths, targets, target_lengths, wavs, stop_targets, mel_spec in val_loader:
             if rank == 0:
                 print(f"Val loop iteration {loop_iteration}")
             loop_iteration += 1
@@ -414,8 +437,8 @@ if __name__ == "__main__":
     
     local_batch_size = batch_size // world_size
     
-    encoder = Encoder(INPUT_DIM, 3, 6, d_model)
-    decoder = Decoder(NUM_RESIDUALS, n_heads=3, n_layers=6, d_model=d_model)
+    encoder = Encoder(INPUT_DIM, 4, 6, d_model)
+    decoder = Decoder(NUM_RESIDUALS, n_heads=4, n_layers=6, d_model=d_model)
     model = TokenizedAudioModel(encoder, decoder, d_model)
     
     # PARAMS FOR token_audio_small_model_latent_X
@@ -491,15 +514,22 @@ if __name__ == "__main__":
     val_stop_loss = []
     val_wer_score = []
     
-    
-    os.makedirs(f"/scratch/wongbr55/{MODEL_NAME}", exist_ok=True)
-    
+    if rank == 0:
+        print(MODEL_NAME)
+        os.makedirs(f"/scratch/wongbr55/{MODEL_NAME}", exist_ok=True)
+        print(f"/scratch/wongbr55/{MODEL_NAME}")
+
+
+    # use mixed teacher forcing
+    initial_ratio = 1.0      # start fully teacher forcing
+    final_ratio   = 0.1
+
     for epoch in range(num_epochs):
         if rank == 0:
             print(f"##############")
             print(f"Starting epoch {epoch}")
         
-        train_loss_sum, train_reg_sum, train_stop_sum, train_count = train_loop_token_audio(train_loader, model, device, optimizer, stop_threshold, train_sampler, epoch)
+        train_loss_sum, train_reg_sum, train_stop_sum, train_count = train_loop_token_audio(train_loader, model, device, optimizer, stop_threshold, train_sampler, epoch, initial_ratio, final_ratio)
         val_loss_sum, val_reg_sum, val_stop_sum, val_count, wer_score_total, total_gt_words = val_loop_token_audio(val_loader, model, device, stop_threshold, val_sampler, epoch, encodec_model, latent_timestep)
         
         avg_train_loss = train_loss_sum / train_count
@@ -520,7 +550,7 @@ if __name__ == "__main__":
         val_wer_score.append(wer_score_total / total_gt_words)
         
         
-        if rank == 0:
+        if rank == 0 and epoch >= 90:
             torch.save({
             "epoch": epoch,
             "model_state_dict": model.state_dict(),
