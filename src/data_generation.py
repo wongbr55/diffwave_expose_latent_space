@@ -139,7 +139,6 @@ def load_h5py_file(file_path: str):
             data['trial_num'].append(trial_num)
     return data
 
-
 if __name__ == "__main__":
     generate_latent_and_mel("/scratch/wongbr55/brain_to_text_25/t15_copyTask_neuralData/hdf5_data_final",
                             "/scratch/wongbr55/latent_mel_data",
