@@ -6,7 +6,7 @@ from torch.utils.data import DistributedSampler
 import torchaudio
 
 import numpy as np
-from data_loading import construct_latent_dataset, NeuralLatentWERDataset
+from data_loading import NeuralLatentWERDataset
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader
 from torch.optim import AdamW
@@ -64,87 +64,74 @@ class Encoder(nn.Module):
         return memory, padding_mask
 
 
-class Decoder(nn.Module):
-    def __init__(
-        self,
-        output_size,
-        d_model=512,
-        n_heads=8,
-        n_layers=6,
-        dim_ff=2048,
-        max_len=2048,
-        dropout=0.1
-    ):
+class NonAutoregressiveMelDecoder(nn.Module):
+    def __init__(self, d_model, mel_dim):
         super().__init__()
-        
-        self.input_proj = nn.Linear(output_size, d_model)
-        self.pos_embed = SinusoidalPositionalEncoding(d_model)
-        
-        decoder_layer = nn.TransformerDecoderLayer(
-            d_model=d_model,
-            nhead=n_heads,
-            dim_feedforward=dim_ff,
-            dropout=dropout,
-            batch_first=True
+        self.length_predictor = nn.Linear(d_model, 1)
+        self.mel_proj = nn.Linear(d_model, mel_dim)
+        self.pos_emb = SinusoidalPositionalEncoding(d_model)
+        self.refiner = nn.TransformerEncoder(
+            nn.TransformerEncoderLayer(d_model=d_model, nhead=4, batch_first=True),
+            num_layers=2
         )
-        
-        self.decoder = nn.TransformerDecoder(
-            decoder_layer,
-            num_layers=n_layers
-        )
-        
-        self.lm_head = nn.Linear(d_model, output_size)
 
-    def forward(self, tgt_tokens, memory):
-        """
-        tgt_tokens: (B, T)
-        memory:     (B, S, d_model)  # encoder output
-        """
-        B, T, __ = tgt_tokens.shape
-        
-        tgt = self.input_proj(tgt_tokens)
-        tgt = self.pos_embed(tgt)
-        
-        # Causal mask for decoder
-        tgt_mask = torch.triu(
-            torch.ones(T, T, device=tgt_tokens.device),
-            diagonal=1
-        ).bool()
-        
-        out = self.decoder(
-            tgt=tgt,
-            memory=memory,
-            tgt_mask=tgt_mask
+    def upsample(self, memory, target_lengths):
+        B, S, D = memory.shape
+        max_len = target_lengths.max()
+
+        memory = memory.permute(0, 2, 1)  # (B, D, S)
+
+        expanded = F.interpolate(
+            memory,
+            size=max_len,
+            mode="linear",
+            align_corners=False
         )
-        
-        logits = self.lm_head(out)
-        return logits, out
+
+        return expanded.permute(0, 2, 1)
+
+    def forward(self, memory, target_lengths=None):
+        B, S, D = memory.shape
+
+        # ---- length prediction ----
+        pooled = memory.mean(dim=1)
+        pred_len = self.length_predictor(pooled).squeeze(-1)
+
+        if target_lengths is not None:
+            lengths = target_lengths
+        else:
+            lengths = pred_len.clamp(min=1).long()
+
+        # ---- upsample properly ----
+        T = lengths.max().item()
+        pos = self.pos_emb.pe[:, :T, :]  # (1, T, D)
+        expanded = self.upsample(memory, lengths)
+        expanded = expanded + pos
+        mask = torch.arange(T, device=lengths.device)[None, :] >= lengths[:, None]
+        expanded = self.refiner(expanded, src_key_padding_mask=mask)
+
+        # ---- predict mel ----
+        mel = self.mel_proj(expanded)
+
+        return mel, pred_len
 
 
 class MelSpecModel(nn.Module):
-    def __init__(self, encoder: Encoder, decoder: Decoder, d_model):
+    def __init__(self, encoder: Encoder, decoder: NonAutoregressiveMelDecoder, d_model):
         super().__init__()
         self.encoder = encoder
         self.decoder = decoder
-        self.stop_head = nn.Linear(d_model, 1)
 
-    def forward(self, src, src_lengths, tgt_tokens):
-        """
-        Args:
-            src: (B, S, input_dim)  # encoder inputs
-            src_lengths: (B,)        # lengths of each input sequence
-            tgt_tokens: (B, T)       # decoder input tokens (teacher forcing)
-        
-        Returns:
-            logits: (B, T, vocab_size)
-        """
-        # Encode
-        B = src.shape[0]
-        tgt_tokens = tgt_tokens.float()
+    def forward(self, src, src_lengths, tgt_lengths=None):
         memory, _ = self.encoder(src, src_lengths)
-        mel_preds, hidden = self.decoder(tgt_tokens, memory)
-        stop_logits = self.stop_head(hidden).squeeze(-1)
-        return mel_preds, stop_logits
+
+        # Decoder should output full sequence directly
+        if tgt_lengths is not None:
+            mel_preds, pred_lengths = self.decoder(memory, tgt_lengths)
+        else:
+            mel_preds, pred_lengths = self.decoder(memory)
+
+        return mel_preds, pred_lengths
 
 
 def collate_fn_mel_spec(batch):
@@ -191,21 +178,18 @@ def collate_fn_mel_spec(batch):
     
     return inputs, input_lengths, targets, target_lengths, [b["wav_form"] for b in batch], stop_targets
 
-def train_loop_mel_spec(train_loader, model, device, optimizer, stop_loss_threshold, sampler, epoch, initial_ratio, final_ratio):
+def train_loop_mel_spec(
+    train_loader, model, device, optimizer, sampler, epoch
+):
     model.train()
     sampler.set_epoch(epoch)
+
     train_loss_sum = torch.tensor(0.0, device=device)
     train_reg_sum  = torch.tensor(0.0, device=device)
-    train_stop_sum = torch.tensor(0.0, device=device)
+    train_length_sum = torch.tensor(0.0, device=device)
     train_count    = torch.tensor(0.0, device=device)
 
-    teacher_forcing_ratio = initial_ratio - (initial_ratio - final_ratio) * (epoch / num_epochs)
-    teacher_forcing_ratio = max(final_ratio, teacher_forcing_ratio)
-    loop_counter = 0
     for inputs, input_lengths, targets, target_lengths, wavs, stop_targets in train_loader:
-        if rank == 0:
-            print(f"Training loop iteration {loop_counter}")
-        loop_counter += 1
 
         inputs = inputs.to(device)
         input_lengths = input_lengths.to(device)
@@ -214,85 +198,60 @@ def train_loop_mel_spec(train_loader, model, device, optimizer, stop_loss_thresh
         stop_targets = stop_targets.to(device)
 
         optimizer.zero_grad()
-        
-        bos = torch.zeros(inputs.shape[0], 1, MEL_SPEC_COL_LEN, device=targets.device)
-        decoder_input  = torch.cat([bos, targets[:, :-1]], dim=1)
-        # Encode once
-        memory, _ = model.module.encoder(inputs, input_lengths)
+
+        # ---- Forward (single pass) ----
+        preds, pred_lengths = model(inputs, input_lengths, target_lengths)
 
         B, T, D = targets.shape
 
-        # BOS
-        bos = torch.zeros(B, 1, D, device=device)
-
-        # ---- PASS 1: teacher-forced (NO grad) ----
-        gt_input = torch.cat([bos, targets[:, :-1]], dim=1)
-
-        with torch.no_grad():
-            preds_tf, hidden_tf = model.module.decoder(gt_input, memory)
-            # preds_tf: [B, T, F]
-
-        # ---- MIX teacher forcing ----
-        use_tf = (torch.rand(B, T, device=device) < teacher_forcing_ratio).unsqueeze(-1)  # [B, T, 1]
-
-        mixed = torch.where(use_tf, targets, preds_tf)  # [B, T, F]
-
-        # Shift for decoder input
-        decoder_input = torch.cat([bos, mixed[:, :-1]], dim=1)
-
-        # ---- PASS 2: real forward (WITH grad) ----
-        preds, hidden = model.module.decoder(decoder_input, memory)
-        stop_logits = model.module.stop_head(hidden).squeeze(-1)
-        
-
-        mask = torch.arange(T, device=device)[None, :] < (target_lengths[:, None])
+        # ---- Mask ----
+        mask = torch.arange(T, device=device)[None, :] < target_lengths[:, None]
         num_valid = mask.sum()
 
+        # ---- Mel Loss ----
         reg_loss = F.mse_loss(
             preds[mask],
-            targets[:, :T][mask],
+            targets[mask],
             reduction="sum"
         )
 
-        pos_weight = torch.tensor(stop_loss_threshold, device=device)  # try 5–20
-
-        stop_loss = F.binary_cross_entropy_with_logits(
-            stop_logits[:, :T],
-            stop_targets[:, :T],
-            pos_weight=pos_weight,
+        # ---- Length Loss ----
+        length_loss = F.l1_loss(
+            pred_lengths.float(),
+            target_lengths.float(),
             reduction="sum"
         )
 
-        loss = reg_loss + stop_loss
+        loss = reg_loss + length_loss
 
         loss.backward()
         optimizer.step()
 
         train_reg_sum  += reg_loss.detach()
-        train_stop_sum += stop_loss.detach()
         train_loss_sum += loss.detach()
+        train_length_sum += length_loss.detach()
         train_count    += num_valid
 
-    dist.all_reduce(train_loss_sum, op=dist.ReduceOp.SUM)
-    dist.all_reduce(train_reg_sum,  op=dist.ReduceOp.SUM)
-    dist.all_reduce(train_stop_sum, op=dist.ReduceOp.SUM)
-    dist.all_reduce(train_count,    op=dist.ReduceOp.SUM)
+    dist.all_reduce(train_loss_sum)
+    dist.all_reduce(train_reg_sum)
+    dist.all_reduce(train_length_sum)
+    dist.all_reduce(train_count)
 
     return (
         train_loss_sum.item(),
         train_reg_sum.item(),
-        train_stop_sum.item(),
+        train_length_sum.item(),
         train_count.item()
     )
 @torch.no_grad()
-def val_loop_mel_spec(val_loader, model, device, stop_loss_threshold, sampler, epoch):
+def val_loop_mel_spec(val_loader, model, device, sampler, epoch):
     model.eval()
     stt_model = whisper.load_model(WHISPER_MODEL_PATH)
     sampler.set_epoch(epoch)
 
     val_loss_sum = torch.tensor(0.0, device=device)
     val_reg_sum  = torch.tensor(0.0, device=device)
-    val_stop_sum = torch.tensor(0.0, device=device)
+    val_length_sum = torch.tensor(0.0, device=device)
     val_count    = torch.tensor(0.0, device=device)
     total_errors = torch.zeros(1, device=device)
     loop_iteration = 0
@@ -306,10 +265,8 @@ def val_loop_mel_spec(val_loader, model, device, stop_loss_threshold, sampler, e
         target_lengths = target_lengths.to(device)
         stop_targets = stop_targets.to(device)
 
+        preds, pred_lengths = model(inputs, input_lengths)
         B, T, D = targets.shape
-        bos = torch.zeros(inputs.shape[0], 1, MEL_SPEC_COL_LEN, device=targets.device)
-        decoder_input  = torch.cat([bos, targets[:, :-1]], dim=1)
-        preds, stop_logits = model(inputs, input_lengths, decoder_input)
                     
         # preds = prepare_decoder_preds_for_diffwave(preds)
         # PERFORM WER CALC ON PREDICTED
@@ -348,24 +305,21 @@ def val_loop_mel_spec(val_loader, model, device, stop_loss_threshold, sampler, e
             reduction="sum"
         )
 
-        pos_weight = torch.tensor(stop_loss_threshold, device=device)
-        stop_loss = F.binary_cross_entropy_with_logits(
-            stop_logits[:, :T],
-            stop_targets[:, :T],
-            pos_weight=pos_weight,
+        length_loss = F.l1_loss(
+            pred_lengths.float(),
+            target_lengths.float(),
             reduction="sum"
         )
-
-        loss = reg_loss + stop_loss_threshold * stop_loss
+        loss = reg_loss + length_loss
 
         val_reg_sum  += reg_loss
-        val_stop_sum += stop_loss
+        val_length_sum += length_loss
         val_loss_sum += loss
         val_count    += num_valid
 
     dist.all_reduce(val_loss_sum, op=dist.ReduceOp.SUM)
     dist.all_reduce(val_reg_sum,  op=dist.ReduceOp.SUM)
-    dist.all_reduce(val_stop_sum, op=dist.ReduceOp.SUM)
+    dist.all_reduce(val_length_sum, op=dist.ReduceOp.SUM)
     dist.all_reduce(val_count,    op=dist.ReduceOp.SUM)
     dist.all_reduce(total_errors, op=dist.ReduceOp.SUM)
     dist.all_reduce(total_gt_words, op=dist.ReduceOp.SUM)
@@ -373,7 +327,7 @@ def val_loop_mel_spec(val_loader, model, device, stop_loss_threshold, sampler, e
     return (
         val_loss_sum.item(),
         val_reg_sum.item(),
-        val_stop_sum.item(),
+        val_length_sum.item(),
         val_count.item(),
         total_errors,
         total_gt_words
@@ -384,7 +338,7 @@ def create_mel_model():
     INPUT_DIM = 512
     d_model = 128
     encoder = Encoder(INPUT_DIM, 2, 4, d_model)
-    decoder = Decoder(MEL_SPEC_COL_LEN, n_heads=2, n_layers=4, d_model=d_model)
+    decoder = NonAutoregressiveMelDecoder(d_model=d_model, mel_dim=MEL_SPEC_COL_LEN)
     model = MelSpecModel(encoder, decoder, d_model=d_model)
     return model
     
@@ -394,17 +348,17 @@ if __name__ == "__main__":
     world_size = int(os.environ["WORLD_SIZE"])
     setup_ddp(rank, world_size)
     
-    MODEL_NAME = "mel_spec_model_med_loss"
+    MODEL_NAME = "nar_mel_spec_model"
     INPUT_DIM = 512
-    d_model = 256
+    d_model = 128
     num_epochs = 100
-    stop_threshold = 50
+    stop_threshold = 10
     batch_size = 128
     device = torch.device(f"cuda:{rank}")
     local_batch_size = batch_size // world_size
     
-    encoder = Encoder(INPUT_DIM, 4, 6, d_model)
-    decoder = Decoder(MEL_SPEC_COL_LEN, n_heads=4, n_layers=6, d_model=d_model)
+    encoder = Encoder(INPUT_DIM, 2, 4, d_model)
+    decoder = NonAutoregressiveMelDecoder(d_model=d_model, mel_dim=MEL_SPEC_COL_LEN)
     model = MelSpecModel(encoder, decoder, d_model=d_model)
     
     
@@ -414,7 +368,7 @@ if __name__ == "__main__":
         device_ids=[rank],
         output_device=rank
     )
-    optimizer = AdamW(model.parameters(), lr=5e-2)
+    optimizer = AdamW(model.parameters(), lr=5e-4)
     
     train_dataset = NeuralLatentWERDataset("/scratch/wongbr55/latent_mel_data", train_or_val=True, latent_timestep=0)
     val_dataset = NeuralLatentWERDataset("/scratch/wongbr55/latent_mel_data", train_or_val=False, latent_timestep=0)
@@ -456,11 +410,11 @@ if __name__ == "__main__":
     
     train_total_loss = []
     train_reg_loss = []
-    train_stop_loss = []
+    train_length_loss = []
     
     val_total_loss = []
     val_reg_loss = []
-    val_stop_loss = []
+    val_length_loss = []
     val_wer_score = []
     
     
@@ -472,24 +426,24 @@ if __name__ == "__main__":
         if rank == 0:
             print(f"##############")
             print(f"Starting epoch {epoch}")
-        train_loss_sum, train_reg_sum, train_stop_sum, train_count = train_loop_mel_spec(train_loader, model, device, optimizer, stop_threshold, train_sampler, epoch, initial_ratio, final_ratio)
-        val_loss_sum, val_reg_sum, val_stop_sum, val_count, wer_score_total, total_gt_words = val_loop_mel_spec(val_loader, model, device, stop_threshold, val_sampler, epoch)
+        train_loss_sum, train_reg_sum, train_length_sum, train_count = train_loop_mel_spec(train_loader, model, device, optimizer, train_sampler, epoch)
+        val_loss_sum, val_reg_sum, val_length_sum, val_count, wer_score_total, total_gt_words = val_loop_mel_spec(val_loader, model, device, val_sampler, epoch)
         
         avg_train_loss = train_loss_sum / train_count
         avg_train_reg = train_reg_sum / train_count
-        avg_train_stop = train_stop_sum / train_count
+        avg_train_length = train_length_sum / train_count
         
         avg_val_loss = val_loss_sum / val_count
         avg_val_reg = val_reg_sum / val_count
-        avg_val_stop = val_stop_sum / val_count
+        avg_val_length = val_length_sum / val_count
         
         train_total_loss.append(avg_train_loss)
         train_reg_loss.append(avg_train_reg)
-        train_stop_loss.append(avg_train_stop)
+        train_length_loss.append(avg_train_length)
         
         val_total_loss.append(avg_val_loss)
         val_reg_loss.append(avg_val_reg)
-        val_stop_loss.append(avg_val_stop)
+        val_length_loss.append(avg_val_length)
         val_wer_score.append(wer_score_total / total_gt_words)
         
         
@@ -500,9 +454,9 @@ if __name__ == "__main__":
             "optimizer_state_dict": optimizer.state_dict(),
             "train_total_loss" : train_total_loss,
             "train_reg_loss" : train_reg_loss,
-            "train_stop_loss" : train_stop_loss,
+            "train_length_loss" : train_length_loss,
             "val_total_loss" : val_total_loss,
             "val_reg_loss" : val_reg_loss,
-            "val_stop_loss" : val_stop_loss,
+            "val_length_loss" : val_length_loss,
             "val_wer_score" : val_wer_score
             }, f"/scratch/wongbr55/{MODEL_NAME}/{MODEL_NAME}_checkpoint_epoch_{epoch}.pt")

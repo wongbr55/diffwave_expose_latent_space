@@ -75,7 +75,7 @@ def collate_combined_model(batch):
     ).contiguous()
     
     lengths = torch.tensor([b["targets"].shape[1] for b in batch])
-    max_len = lengths.max()``
+    max_len = lengths.max()
     stop_targets = torch.zeros(len(batch), max_len)
     for i, L in enumerate(lengths):
         stop_targets[i, L-1] = 1.0
@@ -138,18 +138,28 @@ def autoregressive_inference_latent(model, inputs, input_lengths, mel_lengths, s
 
     # Determine max steps to generate per batch item
     raw_latent_len = mel_lengths * MEL_HOP
-    tokenized_latent_len = torch.ceil((mel_lengths * MEL_HOP) / ENCODEC_HOP).long()
+    tokenized_latent_len = torch.ceil(raw_latent_len / ENCODEC_HOP).long()
 
-    for __ in range(torch.max(tokenized_latent_len)):
+    for t in range(torch.max(tokenized_latent_len)):
         preds, hidden = model.decoder(decoder_input, memory)
         stop_logits = model.stop_head(hidden[:, -1, :]).squeeze(-1)
 
         next_step_logits = preds[:, -1, :, :]
-        all_preds.append(next_step_logits.unsqueeze(1))
-        all_stop_logits.append(stop_logits.unsqueeze(1))
+        active = (t < tokenized_latent_len).view(B, 1, 1)   # [B,1,1]
 
-        next_tokens = next_step_logits.argmax(dim=-1).float().unsqueeze(1)
-        decoder_input = torch.cat([decoder_input, next_tokens], dim=1)
+        all_preds.append(next_step_logits.unsqueeze(1) * active.unsqueeze(-1))
+        all_stop_logits.append(stop_logits.unsqueeze(1) * active.squeeze(-1))
+
+        # Get predicted tokens
+        next_tokens = next_step_logits.argmax(dim=-1).float().unsqueeze(1)  # [B,1,R]
+
+        next_input = torch.where(
+            active,
+            next_tokens,
+            decoder_input[:, -1:, :]   # keep last token if inactive
+        )
+
+        decoder_input = torch.cat([decoder_input, next_input], dim=1)
 
     preds = torch.cat(all_preds, dim=1)
     stop_probs = torch.cat(all_stop_logits, dim=1)
@@ -157,7 +167,7 @@ def autoregressive_inference_latent(model, inputs, input_lengths, mel_lengths, s
     return preds, stop_probs, tokenized_latent_len, raw_latent_len
 
 @torch.no_grad()
-def val_loop(val_loader, latent_model, mel_model, device, encodec_model, latent_timestep, stop_threshold):
+def inference_evaluation(val_loader, latent_model, mel_model, device, encodec_model, latent_timestep, stop_threshold):
     stt_model = whisper.load_model(WHISPER_MODEL_PATH)
     latent_model.eval()
     mel_model.eval()
@@ -197,18 +207,25 @@ def val_loop(val_loader, latent_model, mel_model, device, encodec_model, latent_
         latent_preds, __, tokenized_latent_lengths, raw_latent_lengths = autoregressive_inference_latent(
             latent_model, inputs, input_lengths, mel_lengths
         )
-                    
         #  get WER rate
         for i in range(0, latent_preds.shape[0]):
-            curr_tokenized_latent_length = tokenized_latent_lengths[i].item()
-            codes = latent_preds[i][:curr_tokenized_latent_length].argmax(dim=-1).permute(1, 0).unsqueeze(0).to(device)
+            codes = latent_preds[i].argmax(dim=-1).permute(1, 0).unsqueeze(0).to(device)
             scale = torch.tensor(1.0, device=codes.device)
             encoded_frames = [(codes, scale)]
             gen_wav = encodec_model.decode(encoded_frames)
             gen_wav = gen_wav.cpu()
             gen_wav = convert_audio(gen_wav, encodec_model.sample_rate, SAMPLE_RATE, 1)
-            gen_wav = gen_wav[..., :int(raw_latent_lengths[i].item())].squeeze(1)
-            gen_wav = gen_wav.to(device)
+            gen_wav = gen_wav.to(device).squeeze(1)
+            # sometimes we have to do some extra padding
+            expected_wav_len = int(raw_latent_lengths[i].item())
+            if gen_wav.shape[-1] < expected_wav_len:
+                pad_amount = expected_wav_len - gen_wav.shape[-1]
+                gen_wav = F.pad(gen_wav, (0, pad_amount))
+            else:
+                gen_wav = gen_wav[..., :expected_wav_len]
+            
+            # print(f"Mel length: {mel_preds[i].transpose(0, 1)[..., :int(mel_lengths[i].item())].shape}")
+            # print(f"Audio length: {gen_wav.shape}")
             audio, __, __ = predict(mel_preds[i].transpose(0, 1)[..., :int(mel_lengths[i].item())], DIFFWAVE_MODEL_PATH, inject_latent_var=(latent_timestep, gen_wav))
             # use STT to get words spoken
             # can squeeze because first dimension of audio is 1 (batch size)
@@ -249,7 +266,8 @@ if __name__ == "__main__":
     MEL_HOP = 256
     ENCODEC_HOP = 320
     batch_size = 128
-    stop_thresholds = [0.1 * i for i in range(0, 11)]
+    stop_thresholds = [0.1 * i for i in range(1, 10)]
+    # stop_thresholds = [0.2]
     
     latent_model = create_latent_model().to(device)
     mel_model = create_mel_model().to(device)
@@ -257,7 +275,7 @@ if __name__ == "__main__":
     encodec_model.set_target_bandwidth(3)
     encodec_model = encodec_model.to(device)
     # load latent model
-    latent_model_name = "token_audio_model_latent_3"
+    latent_model_name = "token_audio_model_med__weighted_stop_latent_4"
     latent_checkpoint = torch.load(f'/scratch/wongbr55/{latent_model_name}/{latent_model_name}_checkpoint_epoch_99.pt')
     latent_state_dict = {
         k.replace("module.", ""): v
@@ -266,7 +284,7 @@ if __name__ == "__main__":
     latent_model.load_state_dict(latent_state_dict)
     
     # mel mopdel
-    mel_model_name = "test_mel_spec_model"
+    mel_model_name = "mel_spec_model_mixed_weighted_stop_loss"
     mel_checkpoint = torch.load(f'/scratch/wongbr55/{mel_model_name}/{mel_model_name}_checkpoint_epoch_99.pt')
     mel_state_dict = {
         k.replace("module.", ""): v
@@ -290,7 +308,7 @@ if __name__ == "__main__":
     
     final_wer = []
     for stop_threshold in stop_thresholds:
-        total_errors, total_gt_words = val_loop(val_loader, latent_model, mel_model, device, encodec_model, latent_timestep, stop_threshold)
+        total_errors, total_gt_words = inference_evaluation(val_loader, latent_model, mel_model, device, encodec_model, latent_timestep, stop_threshold)
         curr_wer = total_errors / total_gt_words
         print(f"Final WER for stop threshold {stop_threshold}: {curr_wer}")
         final_wer.append(curr_wer)

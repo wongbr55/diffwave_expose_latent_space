@@ -83,7 +83,11 @@ class Decoder(nn.Module):
     ):
         super().__init__()
         
-        self.input_proj = nn.Linear(output_size, d_model)
+        # self.input_proj = nn.Linear(output_size, d_model)
+        # self.embedding = nn.Embedding(TOKEN_CLASSES, d_model)
+        self.embeddings = nn.ModuleList([
+            nn.Embedding(TOKEN_CLASSES, d_model) for _ in range(NUM_RESIDUALS)
+        ])
         self.pos_embed = SinusoidalPositionalEncoding(d_model)
         
         decoder_layer = nn.TransformerDecoderLayer(
@@ -105,7 +109,8 @@ class Decoder(nn.Module):
         tgt_tokens = tgt_tokens.float()
         B, T, __ = tgt_tokens.shape
         
-        tgt = self.input_proj(tgt_tokens)
+        embeds = [emb(tgt_tokens[:, :, i]) for i, emb in enumerate(self.embeddings)]
+        tgt = sum(embeds)  # or concat + linear
         tgt = self.pos_embed(tgt)
         
         # Causal mask for decoder
@@ -259,11 +264,12 @@ def train_loop_token_audio(train_loader, model, device, optimizer, stop_loss_thr
             ignore_index=PAD_TOKEN
         )
 
-        last_mask = torch.arange(T, device=device)[None, :] == (target_lengths[:, None] - 1)
+        pos_weight = torch.tensor(stop_loss_threshold, device=device)  # try 5–20
 
         stop_loss = F.binary_cross_entropy_with_logits(
-            stop_logits[last_mask],
-            stop_targets[:, :T][last_mask],
+            stop_logits[:, :T],
+            stop_targets[:, :T],
+            pos_weight=pos_weight,
             reduction="sum"
         )
 
@@ -366,11 +372,12 @@ def val_loop_token_audio(val_loader, model, device, stop_loss_threshold, sampler
                 ignore_index=PAD_TOKEN
             )
 
-            last_mask = torch.arange(T_pred, device=device)[None, :] == (target_lengths[:, None] - 1)
+            pos_weight = torch.tensor(stop_loss_threshold, device=device)  # try 5–20
 
             stop_loss = F.binary_cross_entropy_with_logits(
-                stop_logits[last_mask],
-                stop_targets[:, :T_pred][last_mask],
+                stop_logits[:, :T],
+                stop_targets[:, :T],
+                pos_weight=pos_weight,
                 reduction="sum"
             )
 
@@ -400,9 +407,9 @@ def val_loop_token_audio(val_loader, model, device, stop_loss_threshold, sampler
 
 def create_latent_model():
     INPUT_DIM = 512
-    d_model = 128
-    encoder = Encoder(INPUT_DIM, 2, 4, d_model)
-    decoder = Decoder(NUM_RESIDUALS, n_heads=2, n_layers=4, d_model=d_model)
+    d_model = 256
+    encoder = Encoder(INPUT_DIM, 4, 6, d_model)
+    decoder = Decoder(NUM_RESIDUALS, n_heads=4, n_layers=6, d_model=d_model)
     model = TokenizedAudioModel(encoder, decoder, d_model)
     return model
 
@@ -429,10 +436,10 @@ if __name__ == "__main__":
     # model = TokenizedAudioModel(encoder, decoder, d_model)
     
     # PARAMS FOR token_audio_model_med_latent_X 
-    MODEL_NAME = f"token_audio_model_med_latent_{latent_timestep}"
+    MODEL_NAME = f"token_audio_model_med_embed_latent_{latent_timestep}"
     d_model = 256
     num_epochs = 100
-    stop_threshold = 2
+    stop_threshold = 1
     batch_size = 128
     
     local_batch_size = batch_size // world_size
@@ -550,7 +557,7 @@ if __name__ == "__main__":
         val_wer_score.append(wer_score_total / total_gt_words)
         
         
-        if rank == 0 and epoch >= 90:
+        if rank == 0:
             torch.save({
             "epoch": epoch,
             "model_state_dict": model.state_dict(),
