@@ -26,8 +26,10 @@ from encodec.utils import convert_audio
 from encodec import EncodecModel
 
 TOKEN_CLASSES = 1024
+EOS_TOKEN = 1024
+BOS_TOKEN = 1025
 NUM_RESIDUALS = 4
-PAD_TOKEN = 1024
+PAD_TOKEN = 3000
 
 def setup_ddp(rank, world_size):
     dist.init_process_group(
@@ -86,7 +88,7 @@ class Decoder(nn.Module):
         # self.input_proj = nn.Linear(output_size, d_model)
         # self.embedding = nn.Embedding(TOKEN_CLASSES, d_model)
         self.embeddings = nn.ModuleList([
-            nn.Embedding(TOKEN_CLASSES, d_model) for _ in range(NUM_RESIDUALS)
+            nn.Embedding(TOKEN_CLASSES + 2, d_model) for _ in range(NUM_RESIDUALS)
         ])
         self.pos_embed = SinusoidalPositionalEncoding(d_model)
         
@@ -106,7 +108,6 @@ class Decoder(nn.Module):
         self.token_out = nn.Linear(d_model, TOKEN_CLASSES * NUM_RESIDUALS)
 
     def forward(self, tgt_tokens, memory):
-        tgt_tokens = tgt_tokens.float()
         B, T, __ = tgt_tokens.shape
         
         embeds = [emb(tgt_tokens[:, :, i]) for i, emb in enumerate(self.embeddings)]
@@ -135,7 +136,6 @@ class TokenizedAudioModel(nn.Module):
         super().__init__()
         self.encoder = encoder
         self.decoder = decoder
-        self.stop_head = nn.Linear(d_model, 1)
 
     def forward(self, src, src_lengths, tgt_tokens):
         """
@@ -152,8 +152,7 @@ class TokenizedAudioModel(nn.Module):
         B = src.shape[0]
         memory, _ = self.encoder(src, src_lengths)
         preds, hidden = self.decoder(tgt_tokens, memory)
-        stop_logits = self.stop_head(hidden).squeeze(-1)
-        return preds, stop_logits
+        return preds
 
 
 def collate_fn_token_audio(batch):
@@ -222,39 +221,35 @@ def train_loop_token_audio(train_loader, model, device, optimizer, stop_loss_thr
 
         optimizer.zero_grad()
         
-        bos = torch.full(
-            (targets.shape[0], 1, NUM_RESIDUALS),
-            0,
-            device=targets.device
-        )
-        B, T, R = targets.shape
+        B, _, R = targets.shape
         # Encode once
         memory, _ = model.module.encoder(inputs, input_lengths)
-
+        pdb.set_trace()
         # BOS
-        bos = torch.zeros(B, 1, R, device=device, dtype=targets.dtype)
+        bos = torch.full((B, 1, R), BOS_TOKEN, device=device, dtype=targets.dtype)
+        eos_column = torch.full((B, 1, R), EOS_TOKEN, device=device, dtype=targets.dtype)
+        targets = torch.cat([targets, eos_column], dim=1)
+        target_lengths = target_lengths + 1
+        T = targets.shape[1]
 
         # ---- PASS 1: teacher-forced (NO grad) ----
         gt_input = torch.cat([bos, targets[:, :-1]], dim=1)
 
         with torch.no_grad():
-            preds_tf, _ = model.module.decoder(gt_input.float(), memory)
+            preds_tf, _ = model.module.decoder(gt_input, memory)
             pred_tokens = preds_tf.argmax(dim=-1)  # [B, T, R]
 
         # ---- MIX teacher forcing ----
         use_tf = (torch.rand(B, T, device=device) < teacher_forcing_ratio).unsqueeze(-1)
-
+        use_tf[:, -1] = True  # always teacher force EOS position
         mixed_tokens = torch.where(use_tf, targets, pred_tokens)
 
         # Shift again for decoder input
         decoder_input = torch.cat([bos, mixed_tokens[:, :-1]], dim=1)
 
         # ---- PASS 2: real forward (WITH grad) ----
-        preds, hidden = model.module.decoder(decoder_input.float(), memory)
-        stop_logits = model.module.stop_head(hidden).squeeze(-1)
-        
-        mask = torch.arange(T, device=device)[None, :] < (target_lengths[:, None])
-        num_valid = mask.sum()
+        preds, __ = model.module.decoder(decoder_input, memory)
+                
         targets = targets.permute(0, 2, 1)
         B, T, R, C = preds.shape
 
@@ -263,23 +258,18 @@ def train_loop_token_audio(train_loader, model, device, optimizer, stop_loss_thr
             targets.reshape(B*T*R),
             ignore_index=PAD_TOKEN
         )
+        mask = torch.arange(T, device=device)[None, :] < target_lengths[:, None]
+        mask = mask.unsqueeze(-1).expand(B, T, R).reshape(-1)
 
-        pos_weight = torch.tensor(stop_loss_threshold, device=device)  # try 5–20
+        reg_loss = (reg_loss * mask).sum() / mask.sum()
 
-        stop_loss = F.binary_cross_entropy_with_logits(
-            stop_logits[:, :T],
-            stop_targets[:, :T],
-            pos_weight=pos_weight,
-            reduction="sum"
-        )
-
-        loss = reg_loss + stop_loss_threshold * stop_loss
+        loss = reg_loss
 
         loss.backward()
         optimizer.step()
-
+        num_valid = mask.sum()
         train_reg_sum  += reg_loss.detach()
-        train_stop_sum += stop_loss.detach()
+        train_stop_sum += 0
         train_loss_sum += loss.detach()
         train_count    += num_valid
 
@@ -294,10 +284,9 @@ def train_loop_token_audio(train_loader, model, device, optimizer, stop_loss_thr
         train_stop_sum.item(),
         train_count.item()
     )
-
-def val_loop_token_audio(val_loader, model, device, stop_loss_threshold, sampler, epoch, encodec_model, latent_timestep):
+@torch.no_grad()
+def val_loop_token_audio(val_loader, model, device, stop_loss_threshold, sampler, epoch, encodec_model, latent_timestep, stt_model):
     model.eval()
-    stt_model = whisper.load_model(WHISPER_MODEL_PATH)
     sampler.set_epoch(epoch)
 
     val_loss_sum = torch.tensor(0.0, device=device)
@@ -307,86 +296,84 @@ def val_loop_token_audio(val_loader, model, device, stop_loss_threshold, sampler
     total_errors = torch.zeros(1, device=device)
     loop_iteration = 0
     total_gt_words = torch.zeros(1, device=device)
-    with torch.no_grad():
-        for inputs, input_lengths, targets, target_lengths, wavs, stop_targets, mel_spec in val_loader:
-            if rank == 0:
-                print(f"Val loop iteration {loop_iteration}")
-            loop_iteration += 1
-            inputs = inputs.to(device)
-            targets = targets.to(device)
-            target_lengths = target_lengths.to(device)
-            stop_targets = stop_targets.to(device)
+    
+    for inputs, input_lengths, targets, target_lengths, wavs, stop_targets, mel_spec in val_loader:
+        if rank == 0:
+            print(f"Val loop iteration {loop_iteration}")
+        loop_iteration += 1
+        inputs = inputs.to(device)
+        targets = targets.to(device)
+        target_lengths = target_lengths.to(device)
+        stop_targets = stop_targets.to(device)
 
-            bos = torch.full(
-                (targets.shape[0], 1, NUM_RESIDUALS),
-                0,
-                device=targets.device
-            )
-            decoder_input = torch.cat([bos, targets[:, :-1, :]], dim=1)
-            preds, stop_logits = model(inputs, input_lengths, decoder_input)
-                        
-            # preds = prepare_decoder_preds_for_diffwave(preds)
-            # PERFORM WER CALC ON PREDICTED
-            for i in range(0, preds.shape[0]):
-                codes = preds[i].argmax(dim=-1).permute(1, 0).unsqueeze(0).to(device)
-                scale = torch.tensor(1.0, device=codes.device)
-                encoded_frames = [(codes, scale)]
-                gen_wav = encodec_model.decode(encoded_frames)
-                gen_wav = gen_wav.cpu()
-                gen_wav = convert_audio(gen_wav, encodec_model.sample_rate, SAMPLE_RATE, 1)
-                gen_wav = gen_wav[..., :wavs[i].shape[-1]].squeeze(1)
-                gen_wav = gen_wav.to(device)
-                audio, __, __ = predict(mel_spec[i], DIFFWAVE_MODEL_PATH, inject_latent_var=(latent_timestep, gen_wav))
-                # use STT to get words spoken
-                # can squeeze because first dimension of audio is 1 (batch size)
-                audio = audio.squeeze(0)
-                wav_tensor = torch.tensor(wavs[i], dtype=torch.float32)  # convert to float tens
-                gt_audio_16k = torchaudio.functional.resample(wav_tensor, SAMPLE_RATE, WHISPER_SAMPLE_RATE)
-                gen_audio_16k = torchaudio.functional.resample(audio, SAMPLE_RATE, WHISPER_SAMPLE_RATE)
-                gt_speech = stt_model.transcribe(
-                gt_audio_16k.cpu().numpy().astype("float32"),
-                    language="en",
-                    task="transcribe"
-                    )["text"]
-
-                gen_speech = stt_model.transcribe(
-                    gen_audio_16k.cpu().numpy().astype("float32"),
-                    language="en",
-                    task="transcribe"
+        B, _, R = targets.shape
+        bos = torch.full((B, 1, R), BOS_TOKEN, device=device, dtype=targets.dtype)
+        eos_column = torch.full((B, 1, R), EOS_TOKEN, device=device, dtype=targets.dtype)
+        targets = torch.cat([targets, eos_column], dim=1)
+        target_lengths = target_lengths + 1
+        T = targets.shape[1]
+        decoder_input = torch.cat([bos, targets[:, :-1, :]], dim=1)
+        preds = model(inputs, input_lengths, decoder_input)
+                    
+        # preds = prepare_decoder_preds_for_diffwave(preds)
+        # PERFORM WER CALC ON PREDICTED
+        for i in range(0, preds.shape[0]):
+            tokens = preds[i].argmax(dim=-1)  # [T, R]
+            # length INCLUDING EOS
+            L = target_lengths[i].item()
+            tokens = tokens[:L-1]
+            codes = tokens.permute(1, 0).unsqueeze(0).to(device)
+            # codes = preds[i].argmax(dim=-1).permute(1, 0).unsqueeze(0).to(device)
+            scale = torch.tensor(1.0, device=codes.device)    
+            encoded_frames = [(codes, scale)]
+            gen_wav = encodec_model.decode(encoded_frames)
+            gen_wav = gen_wav.cpu()
+            gen_wav = convert_audio(gen_wav, encodec_model.sample_rate, SAMPLE_RATE, 1)
+            gen_wav = gen_wav[..., :wavs[i].shape[-1]].squeeze(1)
+            gen_wav = gen_wav.to(device)
+            audio, __, __ = predict(mel_spec[i], DIFFWAVE_MODEL_PATH, inject_latent_var=(latent_timestep, gen_wav))
+            # use STT to get words spoken
+            # can squeeze because first dimension of audio is 1 (batch size)
+            audio = audio.squeeze(0)
+            wav_tensor = torch.tensor(wavs[i], dtype=torch.float32)  # convert to float tens
+            gt_audio_16k = torchaudio.functional.resample(wav_tensor, SAMPLE_RATE, WHISPER_SAMPLE_RATE)
+            gen_audio_16k = torchaudio.functional.resample(audio, SAMPLE_RATE, WHISPER_SAMPLE_RATE)
+            gt_speech = stt_model.transcribe(
+            gt_audio_16k.cpu().numpy().astype("float32"),
+                language="en",
+                task="transcribe"
                 )["text"]
-                out = process_words(gt_speech, gen_speech)
 
-                errors = out.substitutions + out.deletions + out.insertions
-                total_errors += errors
-                total_gt_words += len(gt_speech.split())
-            
-            T_pred = preds.size(1)
-            mask = torch.arange(T_pred, device=device)[None, :] < (target_lengths[:, None])
-            num_valid = mask.sum()
-            targets = targets.permute(0, 2, 1)
-            B, T, R, C = preds.shape
+            gen_speech = stt_model.transcribe(
+                gen_audio_16k.cpu().numpy().astype("float32"),
+                language="en",
+                task="transcribe"
+            )["text"]
+            out = process_words(gt_speech, gen_speech)
 
-            reg_loss = F.cross_entropy(
-                preds.reshape(B*T*R, C),
-                targets.reshape(B*T*R),
-                ignore_index=PAD_TOKEN
-            )
+            errors = out.substitutions + out.deletions + out.insertions
+            total_errors += errors
+            total_gt_words += len(gt_speech.split())
+                
+        targets = targets.permute(0, 2, 1)
+        B, T, R, C = preds.shape
 
-            pos_weight = torch.tensor(stop_loss_threshold, device=device)  # try 5–20
+        reg_loss = F.cross_entropy(
+            preds.reshape(B*T*R, C),
+            targets.reshape(B*T*R),
+            ignore_index=PAD_TOKEN
+        )
+        mask = torch.arange(T, device=device)[None, :] < target_lengths[:, None]
+        mask = mask.unsqueeze(-1).expand(B, T, R).reshape(-1)
 
-            stop_loss = F.binary_cross_entropy_with_logits(
-                stop_logits[:, :T],
-                stop_targets[:, :T],
-                pos_weight=pos_weight,
-                reduction="sum"
-            )
+        num_valid = mask.sum()
+        reg_loss = (reg_loss * mask).sum() / mask.sum()
+        loss = reg_loss
 
-            loss = reg_loss + stop_loss_threshold * stop_loss
-
-            val_reg_sum  += reg_loss
-            val_stop_sum += stop_loss
-            val_loss_sum += loss
-            val_count    += num_valid
+        val_reg_sum  += reg_loss
+        val_stop_sum += 0
+        val_loss_sum += loss
+        val_count    += num_valid
 
     dist.all_reduce(val_loss_sum, op=dist.ReduceOp.SUM)
     dist.all_reduce(val_reg_sum,  op=dist.ReduceOp.SUM)
@@ -530,14 +517,14 @@ if __name__ == "__main__":
     # use mixed teacher forcing
     initial_ratio = 1.0      # start fully teacher forcing
     final_ratio   = 0.1
-
+    stt_model = whisper.load_model(WHISPER_MODEL_PATH)
     for epoch in range(num_epochs):
         if rank == 0:
             print(f"##############")
             print(f"Starting epoch {epoch}")
         
         train_loss_sum, train_reg_sum, train_stop_sum, train_count = train_loop_token_audio(train_loader, model, device, optimizer, stop_threshold, train_sampler, epoch, initial_ratio, final_ratio)
-        val_loss_sum, val_reg_sum, val_stop_sum, val_count, wer_score_total, total_gt_words = val_loop_token_audio(val_loader, model, device, stop_threshold, val_sampler, epoch, encodec_model, latent_timestep)
+        val_loss_sum, val_reg_sum, val_stop_sum, val_count, wer_score_total, total_gt_words = val_loop_token_audio(val_loader, model, device, stop_threshold, val_sampler, epoch, encodec_model, latent_timestep, stt_model)
         
         avg_train_loss = train_loss_sum / train_count
         avg_train_reg = train_reg_sum / train_count
