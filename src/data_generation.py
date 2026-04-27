@@ -12,6 +12,9 @@ from diffwave.inference import predict as diffwave_predict
 from diffwave.preprocess import preprocess_directory as mel_spectrogram_proccess
 # package required for loading data
 import h5py
+import pdb
+from encodec import EncodecModel
+from encodec.utils import convert_audio
 
 # DiffWave only works with a specific sample rate
 SAMPLE_RATE = 22050
@@ -23,7 +26,6 @@ def generate_audio_waveforms(sentences: list[str], output_dir: str, voice: Piper
         sentences (list[str]): list of ground truth sentences
         output_dir (str): _description_
     """
-    
     os.makedirs(output_dir, exist_ok=True)
     for i, text in enumerate(sentences, start=1):
         with wave.open(f"{output_dir}/sentence_{i}.wav", "wb") as wav_file:
@@ -59,6 +61,7 @@ def generate_latent_and_mel(file_dir: str, save_dir: str, model_dir: str, tts_di
     """
     # load voice to generate tts
     voice = PiperVoice.load(tts_dir)
+    encodec_model = EncodecModel.encodec_model_24khz()
     # collect data from file_dir
     os.makedirs(save_dir, exist_ok=True)
     for dir_name in os.listdir(file_dir):
@@ -84,17 +87,34 @@ def generate_latent_and_mel(file_dir: str, save_dir: str, model_dir: str, tts_di
                     mel = np.load(f"{curr_dir}/sentence_{i+1}.wav.spec.npy")
                     mel = torch.from_numpy(mel).float()
                     __, __, latent_vars = diffwave_predict(mel, model_dir, fast_sampling=fast_sampling, expose_latent_vars=True)
-                    latent_vars_serializable = {k: v.tolist() for k, v in latent_vars.items()}
                     # extract neural features for sentence i
                     # of length (T, 512)
-                    neural_features = data["neural_features"][i]
+                    np_neural_data = data["neural_features"][i]
                     # save latent variables and latent variables
-                    curr_sentence_data = {
-                        "latent_variables": latent_vars_serializable,
-                        "neural_features": neural_features.tolist() if isinstance(neural_features, np.ndarray) else neural_features
-                    }
-                    with open(os.path.join(curr_dir, f"sentence_{i+1}_neural_latent_data.json"), "w") as f:
-                        json.dump(curr_sentence_data, f, indent=4)
+                    latent_stacked = [latent_vars[k][0].detach().cpu().numpy() for k in range(0, 6)] # there are [0, 5] latent vars inclusive
+                    np_latent_vars = np.array(latent_stacked)
+                    
+                    # save encoded waveforms
+                    conv_wavs =[] 
+                    for latent in np_latent_vars:
+                        wav = torch.from_numpy(latent).unsqueeze(0).unsqueeze(0).float()
+                        conv_wav = convert_audio(wav, SAMPLE_RATE, encodec_model.sample_rate, encodec_model.channels)
+                        conv_wavs.append(conv_wav)
+                    with torch.no_grad():
+                        encoded_frames = encodec_model.encode(torch.cat([wav for wav in conv_wavs]))
+                    codes = torch.cat([encoded[0] for encoded in encoded_frames], dim=-1)  # [B, n_q, T]
+
+                    # need to save codes
+                    save_path = os.path.join(curr_dir, f"sentence_{i}_neural_latent_data.npz")
+                    np.savez(save_path, neural=np_neural_data, latent=np_latent_vars)
+                    torch.save({
+                        "tokenized_latent_var": codes,
+                        "model_sample_rate": encodec_model.sample_rate,
+                        "proper_length": np_latent_vars.shape[1],
+                        "sentence_label": data["sentence_label"][i]
+                    }, os.path.join(curr_dir, f"sentence_{i}_neural_latent_data_tokenized.st"))
+                    
+
         
 # CODE TAKEN FROM KAGGLE TO LOAD DATA
 def load_h5py_file(file_path: str):
