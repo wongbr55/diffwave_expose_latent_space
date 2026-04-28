@@ -313,30 +313,30 @@ def val_loop_mel_spec(val_loader, model, device, stop_loss_threshold, sampler, e
                     
         # preds = prepare_decoder_preds_for_diffwave(preds)
         # PERFORM WER CALC ON PREDICTED
-        for i in range(0, preds.shape[0]):
-            audio, __, __ = predict(preds[i].transpose(0, 1), DIFFWAVE_MODEL_PATH)
-            # use STT to get words spoken
-            # can squeeze because first dimension of audio is 1 (batch size)
-            audio = audio.squeeze(0)
-            wav_tensor = torch.tensor(wavs[i], dtype=torch.float32)  # convert to float tens                
-            gt_audio_16k = torchaudio.functional.resample(wav_tensor, SAMPLE_RATE, WHISPER_SAMPLE_RATE)
-            gen_audio_16k = torchaudio.functional.resample(audio, SAMPLE_RATE, WHISPER_SAMPLE_RATE)
-            gt_speech = stt_model.transcribe(
-            gt_audio_16k.cpu().numpy().astype("float32"),
-                language="en",
-                task="transcribe"
-                )["text"]
-            gen_speech = stt_model.transcribe(
-                gen_audio_16k.cpu().numpy().astype("float32"),
-                language="en",
-                task="transcribe"
-            )["text"]
+        # for i in range(0, preds.shape[0]):
+        #     audio, __, __ = predict(preds[i].transpose(0, 1), DIFFWAVE_MODEL_PATH)
+        #     # use STT to get words spoken
+        #     # can squeeze because first dimension of audio is 1 (batch size)
+        #     audio = audio.squeeze(0)
+        #     wav_tensor = torch.tensor(wavs[i], dtype=torch.float32)  # convert to float tens                
+        #     gt_audio_16k = torchaudio.functional.resample(wav_tensor, SAMPLE_RATE, WHISPER_SAMPLE_RATE)
+        #     gen_audio_16k = torchaudio.functional.resample(audio, SAMPLE_RATE, WHISPER_SAMPLE_RATE)
+        #     gt_speech = stt_model.transcribe(
+        #     gt_audio_16k.cpu().numpy().astype("float32"),
+        #         language="en",
+        #         task="transcribe"
+        #         )["text"]
+        #     gen_speech = stt_model.transcribe(
+        #         gen_audio_16k.cpu().numpy().astype("float32"),
+        #         language="en",
+        #         task="transcribe"
+        #     )["text"]
             
-            out = process_words(gt_speech, gen_speech)
+        #     out = process_words(gt_speech, gen_speech)
 
-            errors = out.substitutions + out.deletions + out.insertions
-            total_errors += errors
-            total_gt_words += len(gt_speech.split())
+        #     errors = out.substitutions + out.deletions + out.insertions
+        #     total_errors += errors
+        #     total_gt_words += len(gt_speech.split())
         
         T_pred = preds.size(1)
         mask = torch.arange(T_pred, device=device)[None, :] < (target_lengths[:, None])

@@ -18,7 +18,7 @@ from jiwer import wer, process_words
 from model_training import WHISPER_MODEL_PATH, WHISPER_SAMPLE_RATE, DIFFWAVE_MODEL_PATH, SAMPLE_RATE
 from diffwave.inference import predict
 from model_mel_spec import create_mel_model
-from model_tokenized_latent import create_latent_model
+from model_tokenized_latent import create_latent_model, EOS_TOKEN, BOS_TOKEN
 
 from encodec.utils import convert_audio
 from encodec import EncodecModel
@@ -82,89 +82,151 @@ def collate_combined_model(batch):
     
     return inputs, input_lengths, tokenized_targets, \
         tokenized_target_lengths, mel_targets, mel_target_lengths, \
-        [b["wav_form"] for b in batch], stop_targets
+        [b["wav_form"] for b in batch], stop_targets, [b["sentence"] for b in batch]
 
 @torch.no_grad()
-def autoregressive_inference_mel(model, src, src_lengths, max_len=1000, stop_threshold=0.5):
+def autoregressive_inference_mel(model, src, src_lengths, tokenized_latent_len, max_len=1000):
     model.eval()
     device = src.device
     B = src.shape[0]
 
     memory, _ = model.encoder(src, src_lengths)
     ys = torch.zeros(B, 1, MEL_SPEC_COL_LEN, device=device)
-    finished = torch.zeros(B, dtype=torch.bool, device=device)
+    # finished = torch.zeros(B, dtype=torch.bool, device=device)
     gen_lengths = torch.zeros(B, dtype=torch.long, device=device)
+    mel_lengths = (tokenized_latent_len * ENCODEC_HOP) // MEL_HOP
+    max_steps = min(max_len, mel_lengths.max().item())
 
-    for t in range(max_len):
-        preds, hidden = model.decoder(ys, memory)
+    for t in range(max_steps):
+        preds, _ = model.decoder(ys, memory)
         next_frame = preds[:, -1:, :]   # (B, 1, mel_dim)
-        stop_logit = model.stop_head(hidden[:, -1, :])  # (B, 1)
-        stop_prob = torch.sigmoid(stop_logit).squeeze(-1)
+
+        # which sequences still need frames
+        active = (t < mel_lengths)  # (B,)
+
+        # update lengths
+        gen_lengths[active] += 1
+
+        # freeze finished sequences (keep last frame)
+        next_frame = torch.where(
+            active.view(B, 1, 1),
+            next_frame,
+            ys[:, -1:, :]
+        )
 
         ys = torch.cat([ys, next_frame], dim=1)
 
-        # Update lengths for sequences not finished
-        gen_lengths[~finished] = t + 1
-        finished = finished | (stop_prob > stop_threshold)
+    # remove BOS
+    ys = ys[:, 1:]
 
-        if finished.all():
-            break
-
-    # For sequences that never triggered stop, length = max_len
-    gen_lengths[gen_lengths == 0] = max_len
-
-    return ys[:, 1:], gen_lengths  # remove BOS
+    return ys, gen_lengths
 
 @torch.no_grad()
-def autoregressive_inference_latent(model, inputs, input_lengths, mel_lengths, start_token=0, device="cuda"):
-    """
-    Generate latent tokens autoregressively, using mel lengths to determine sequence length per batch item.
-    
-    Args:
-        model: TokenizedAudioModel
-        mel_specs: (B, T_mel, MEL_SPEC_COL_LEN)
-        mel_lengths: (B,) actual lengths from mel generation
-        max_len: optional max length override
-    """
+def autoregressive_inference_latent(model, inputs, input_lengths, max_len=2000, start_token=BOS_TOKEN):
     model.eval()
     B = inputs.size(0)
     device = inputs.device
+
     memory, _ = model.encoder(inputs, input_lengths)
 
-    # Decoder input
-    decoder_input = torch.full((B, 1, NUM_RESIDUALS), start_token, device=device, dtype=torch.float32)
+    # Start with BOS
+    decoder_input = torch.full(
+        (B, 1, NUM_RESIDUALS),
+        start_token,
+        device=device,
+        dtype=torch.long
+    )
+
+    finished = torch.zeros(B, dtype=torch.bool, device=device)
+    generated_lengths = torch.zeros(B, dtype=torch.long, device=device)
     all_preds = []
-    all_stop_logits = []
 
-    # Determine max steps to generate per batch item
-    raw_latent_len = mel_lengths * MEL_HOP
-    tokenized_latent_len = torch.ceil(raw_latent_len / ENCODEC_HOP).long()
+    for t in range(max_len):
+        preds, _ = model.decoder(decoder_input, memory)
 
-    for t in range(torch.max(tokenized_latent_len)):
-        preds, hidden = model.decoder(decoder_input, memory)
-        stop_logits = model.stop_head(hidden[:, -1, :]).squeeze(-1)
+        next_logits = preds[:, -1, :, :]
+        next_tokens = next_logits.argmax(dim=-1)  # [B, R]
 
-        next_step_logits = preds[:, -1, :, :]
-        active = (t < tokenized_latent_len).view(B, 1, 1)   # [B,1,1]
+        # who is still active BEFORE this step
+        active = ~finished  # [B]
+        # detect EOS at this step
+        is_eos = (next_tokens == EOS_TOKEN).all(dim=-1)  # [B]
 
-        all_preds.append(next_step_logits.unsqueeze(1) * active.unsqueeze(-1))
-        all_stop_logits.append(stop_logits.unsqueeze(1) * active.squeeze(-1))
+        generated_lengths[active & ~is_eos] += 1
 
-        # Get predicted tokens
-        next_tokens = next_step_logits.argmax(dim=-1).float().unsqueeze(1)  # [B,1,R]
+        # mark finished AFTER counting
+        finished = finished | is_eos
 
-        next_input = torch.where(
-            active,
-            next_tokens,
-            decoder_input[:, -1:, :]   # keep last token if inactive
+        # freeze finished sequences
+        next_tokens = torch.where(
+            finished.unsqueeze(-1),
+            torch.full_like(next_tokens, EOS_TOKEN),
+            next_tokens
         )
 
-        decoder_input = torch.cat([decoder_input, next_input], dim=1)
+        decoder_input = torch.cat(
+            [decoder_input, next_tokens.unsqueeze(1)],
+            dim=1
+        )
 
-    preds = torch.cat(all_preds, dim=1)
-    stop_probs = torch.cat(all_stop_logits, dim=1)
+        if finished.all():
+            break
+        
+    raw_latent_len = generated_lengths * ENCODEC_HOP
+    preds = torch.cat(all_preds, dim=1)  # [B, T, R, C]
+    
+    return preds, generated_lengths, raw_latent_len
 
-    return preds, stop_probs, tokenized_latent_len, raw_latent_len
+# @torch.no_grad()
+# def autoregressive_inference_latent(model, inputs, input_lengths, mel_lengths, start_token=0, device="cuda"):
+#     """
+#     Generate latent tokens autoregressively, using mel lengths to determine sequence length per batch item.
+    
+#     Args:
+#         model: TokenizedAudioModel
+#         mel_specs: (B, T_mel, MEL_SPEC_COL_LEN)
+#         mel_lengths: (B,) actual lengths from mel generation
+#         max_len: optional max length override
+#     """
+#     model.eval()
+#     B = inputs.size(0)
+#     device = inputs.device
+#     memory, _ = model.encoder(inputs, input_lengths)
+
+#     # Decoder input
+#     decoder_input = torch.full((B, 1, NUM_RESIDUALS), start_token, device=device, dtype=torch.float32)
+#     all_preds = []
+#     all_stop_logits = []
+
+#     # Determine max steps to generate per batch item
+#     raw_latent_len = mel_lengths * MEL_HOP
+#     tokenized_latent_len = torch.ceil(raw_latent_len / ENCODEC_HOP).long()
+
+#     for t in range(torch.max(tokenized_latent_len)):
+#         preds, hidden = model.decoder(decoder_input, memory)
+#         stop_logits = model.stop_head(hidden[:, -1, :]).squeeze(-1)
+
+#         next_step_logits = preds[:, -1, :, :]
+#         active = (t < tokenized_latent_len).view(B, 1, 1)   # [B,1,1]
+
+#         all_preds.append(next_step_logits.unsqueeze(1) * active.unsqueeze(-1))
+#         all_stop_logits.append(stop_logits.unsqueeze(1) * active.squeeze(-1))
+
+#         # Get predicted tokens
+#         next_tokens = next_step_logits.argmax(dim=-1).float().unsqueeze(1)  # [B,1,R]
+
+#         next_input = torch.where(
+#             active,
+#             next_tokens,
+#             decoder_input[:, -1:, :]   # keep last token if inactive
+#         )
+
+#         decoder_input = torch.cat([decoder_input, next_input], dim=1)
+
+#     preds = torch.cat(all_preds, dim=1)
+#     stop_probs = torch.cat(all_stop_logits, dim=1)
+
+#     return preds, stop_probs, tokenized_latent_len, raw_latent_len
 
 @torch.no_grad()
 def inference_evaluation(val_loader, latent_model, mel_model, device, encodec_model, latent_timestep, stop_threshold):
@@ -175,10 +237,11 @@ def inference_evaluation(val_loader, latent_model, mel_model, device, encodec_mo
     total_errors = 0
     total_gt_words = 0
     
-    for inputs, input_lengths, tokenized_targets, tokenized_target_lengths, mel_targets, mel_target_lengths, wavs, stop_targets in val_loader:
+    for inputs, input_lengths, tokenized_targets, tokenized_target_lengths, mel_targets, mel_target_lengths, wavs, stop_targets, sentence in val_loader:
         print(f"Val loop iteration {loop_iteration}")
         loop_iteration += 1
         inputs = inputs.to(device)
+        input_lengths = input_lengths.to(device)
         tokenized_targets = tokenized_targets.to(device)
         tokenized_target_lengths = tokenized_target_lengths.to(device)
         mel_targets = mel_targets.to(device)
@@ -200,13 +263,13 @@ def inference_evaluation(val_loader, latent_model, mel_model, device, encodec_mo
         
         
         # AUTOREGRESSION
-        # 1. Generate mel autoregressively
-        mel_preds, mel_lengths = autoregressive_inference_mel(mel_model, inputs, input_lengths, stop_threshold=stop_threshold)
-
-        # 2. Generate latent tokens using exact mel lengths
-        latent_preds, __, tokenized_latent_lengths, raw_latent_lengths = autoregressive_inference_latent(
-            latent_model, inputs, input_lengths, mel_lengths
+        pdb.set_trace()
+        latent_preds, tokenized_latent_lengths, raw_latent_lengths = autoregressive_inference_latent(
+            latent_model, inputs, input_lengths
         )
+        mel_preds, mel_lengths = autoregressive_inference_mel(mel_model, inputs, input_lengths, tokenized_latent_len=tokenized_latent_lengths)
+
+        
         #  get WER rate
         for i in range(0, latent_preds.shape[0]):
             codes = latent_preds[i].argmax(dim=-1).permute(1, 0).unsqueeze(0).to(device)
@@ -217,39 +280,53 @@ def inference_evaluation(val_loader, latent_model, mel_model, device, encodec_mo
             gen_wav = convert_audio(gen_wav, encodec_model.sample_rate, SAMPLE_RATE, 1)
             gen_wav = gen_wav.to(device).squeeze(1)
             # sometimes we have to do some extra padding
-            expected_wav_len = int(raw_latent_lengths[i].item())
-            if gen_wav.shape[-1] < expected_wav_len:
-                pad_amount = expected_wav_len - gen_wav.shape[-1]
-                gen_wav = F.pad(gen_wav, (0, pad_amount))
+            # expected_wav_len = int(raw_latent_lengths[i].item())
+            # if gen_wav.shape[-1] < expected_wav_len:
+            #     pad_amount = expected_wav_len - gen_wav.shape[-1]
+            #     gen_wav = F.pad(gen_wav, (0, pad_amount))
+            # else:
+            #     gen_wav = gen_wav[..., :expected_wav_len]
+            
+            mel = mel_preds[i].transpose(0, 1)  # (mel_dim, T)
+            target_mel_len = gen_wav.shape[-1] // MEL_HOP
+            current_mel_len = mel.shape[-1]
+
+            if current_mel_len < target_mel_len:
+                pad_amount = target_mel_len - current_mel_len
+                mel = F.pad(mel, (0, pad_amount))
             else:
-                gen_wav = gen_wav[..., :expected_wav_len]
+                mel = mel[..., :target_mel_len]
             
             # print(f"Mel length: {mel_preds[i].transpose(0, 1)[..., :int(mel_lengths[i].item())].shape}")
             # print(f"Audio length: {gen_wav.shape}")
-            audio, __, __ = predict(mel_preds[i].transpose(0, 1)[..., :int(mel_lengths[i].item())], DIFFWAVE_MODEL_PATH, inject_latent_var=(latent_timestep, gen_wav))
+            audio, __, __ = predict(
+                mel,
+                DIFFWAVE_MODEL_PATH,
+                inject_latent_var=(latent_timestep, gen_wav)
+            )
             # use STT to get words spoken
             # can squeeze because first dimension of audio is 1 (batch size)
             audio = audio.squeeze(0)
             wav_tensor = torch.tensor(wavs[i], dtype=torch.float32)  # convert to float tens
-            gt_audio_16k = torchaudio.functional.resample(wav_tensor, SAMPLE_RATE, WHISPER_SAMPLE_RATE)
+            # gt_audio_16k = torchaudio.functional.resample(wav_tensor, SAMPLE_RATE, WHISPER_SAMPLE_RATE)
             gen_audio_16k = torchaudio.functional.resample(audio, SAMPLE_RATE, WHISPER_SAMPLE_RATE)
-            gt_speech = stt_model.transcribe(
-            gt_audio_16k.cpu().numpy().astype("float32"),
-                language="en",
-                task="transcribe"
-                )["text"]
+            # gt_speech = stt_model.transcribe(
+            # gt_audio_16k.cpu().numpy().astype("float32"),
+            #     language="en",
+            #     task="transcribe"
+            #     )["text"]
 
             gen_speech = stt_model.transcribe(
                 gen_audio_16k.cpu().numpy().astype("float32"),
                 language="en",
                 task="transcribe"
             )["text"]
-            out = process_words(gt_speech, gen_speech)
+            out = process_words(sentence, gen_speech)
 
             errors = out.substitutions + out.deletions + out.insertions
             total_errors += errors
-            total_gt_words += len(gt_speech.split())
-            del gen_wav, audio, gen_audio_16k, gt_audio_16k
+            total_gt_words += len(sentence.split())
+            del gen_wav, audio, gen_audio_16k #, gt_audio_16k
             torch.cuda.empty_cache()
         
 

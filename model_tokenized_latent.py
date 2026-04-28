@@ -196,7 +196,9 @@ def collate_fn_token_audio(batch):
     for i, L in enumerate(lengths):
         stop_targets[i, L-1] = 1.0
     
-    return inputs, input_lengths, targets, target_lengths, [b["wav_form"] for b in batch], stop_targets, [torch.from_numpy(b["mel_spec"]) for b in batch]
+    return inputs, input_lengths, targets, target_lengths, [b["wav_form"] for b in batch], \
+        stop_targets, [torch.from_numpy(b["mel_spec"]) for b in batch], \
+            [b["sentence"] for b in batch]
 
 def train_loop_token_audio(train_loader, model, device, optimizer, stop_loss_threshold, sampler, epoch, initial_ratio, final_ratio):
     model.train()
@@ -209,7 +211,7 @@ def train_loop_token_audio(train_loader, model, device, optimizer, stop_loss_thr
     teacher_forcing_ratio = initial_ratio - (initial_ratio - final_ratio) * (epoch / num_epochs)
     teacher_forcing_ratio = max(final_ratio, teacher_forcing_ratio)
     loop_counter = 0
-    for inputs, input_lengths, targets, target_lengths, wavs, stop_targets, mel_spec in train_loader:
+    for inputs, input_lengths, targets, target_lengths, wavs, stop_targets, mel_spec, sentence in train_loader:
         if rank == 0:
             print(f"Training loop iteration {loop_counter}")
         loop_counter += 1
@@ -297,7 +299,7 @@ def val_loop_token_audio(val_loader, model, device, stop_loss_threshold, sampler
     loop_iteration = 0
     total_gt_words = torch.zeros(1, device=device)
     
-    for inputs, input_lengths, targets, target_lengths, wavs, stop_targets, mel_spec in val_loader:
+    for inputs, input_lengths, targets, target_lengths, wavs, stop_targets, mel_spec, sentence in val_loader:
         if rank == 0:
             print(f"Val loop iteration {loop_iteration}")
         loop_iteration += 1
@@ -335,25 +337,25 @@ def val_loop_token_audio(val_loader, model, device, stop_loss_threshold, sampler
             # use STT to get words spoken
             # can squeeze because first dimension of audio is 1 (batch size)
             audio = audio.squeeze(0)
-            wav_tensor = torch.tensor(wavs[i], dtype=torch.float32)  # convert to float tens
-            gt_audio_16k = torchaudio.functional.resample(wav_tensor, SAMPLE_RATE, WHISPER_SAMPLE_RATE)
+            # wav_tensor = torch.tensor(wavs[i], dtype=torch.float32)  # convert to float tens
+            # gt_audio_16k = torchaudio.functional.resample(wav_tensor, SAMPLE_RATE, WHISPER_SAMPLE_RATE)
             gen_audio_16k = torchaudio.functional.resample(audio, SAMPLE_RATE, WHISPER_SAMPLE_RATE)
-            gt_speech = stt_model.transcribe(
-            gt_audio_16k.cpu().numpy().astype("float32"),
-                language="en",
-                task="transcribe"
-                )["text"]
+            # gt_speech = stt_model.transcribe(
+            # gt_audio_16k.cpu().numpy().astype("float32"),
+            #     language="en",
+            #     task="transcribe"
+            #     )["text"]
 
             gen_speech = stt_model.transcribe(
                 gen_audio_16k.cpu().numpy().astype("float32"),
                 language="en",
                 task="transcribe"
             )["text"]
-            out = process_words(gt_speech, gen_speech)
+            out = process_words(sentence, gen_speech)
 
             errors = out.substitutions + out.deletions + out.insertions
             total_errors += errors
-            total_gt_words += len(gt_speech.split())
+            total_gt_words += len(sentence.split())
                 
         targets = targets.permute(0, 2, 1)
         B, T, R, C = preds.shape

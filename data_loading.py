@@ -137,9 +137,11 @@ class TokenizedDataset(Dataset):
             gt_latent_waveform = data["latent"][self.latent_timestep]
             gt_waveform = data["latent"][0]
         mel_spec = np.load(mel_spec_path)
-        tokenized_data = torch.load(token_wav_path)["tokenized_latent_var"][self.latent_timestep]
+        tokenized_data = torch.load(token_wav_path)
+        tokenized_data = tokenized_data["tokenized_latent_var"][self.latent_timestep]
+        sentence = tokenized_data["sentence_label"]
         
-        return {"inputs" : neural_data, "targets" : tokenized_data, "wav_form" : gt_waveform, "latent_waveform" : gt_latent_waveform, "mel_spec" : mel_spec}        
+        return {"inputs" : neural_data, "targets" : tokenized_data, "wav_form" : gt_waveform, "latent_waveform" : gt_latent_waveform, "mel_spec" : mel_spec, "sentence" : sentence}        
 
 def construct_latent_dataset(data_dir: str, latent_timestep: int):
     
